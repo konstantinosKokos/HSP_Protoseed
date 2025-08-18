@@ -1,4 +1,4 @@
-// HSP_OptimodBox_v3_18_96k_bs4_AM_constants_TS3invert_WITH_KLON_BOOST.ino
+// HSP_OptimodBox_v1.0.0
 // Broadcast-style loudness box tuned for ≤8 kHz front-end LPF
 // Modes (RV1 Flavor): 0=FM 3-band, 1=FM 5-band, 2=AM Narrowband (≈5 kHz LPF + asym clip)
 // Pots:  RV1=Flavor, RV2=Amount, RV3=Tune, RV4=Harmonics(Air/Bias), RV5=Mix, RV6=Master (post, PROCESSED PATH ONLY)
