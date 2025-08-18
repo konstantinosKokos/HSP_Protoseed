@@ -1,0 +1,44 @@
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+HaroldPCB	KEYWORD1
+HPCB_Curve	KEYWORD1
+HPCB_Pot	KEYWORD1
+HPCB_Toggle	KEYWORD1
+HPCB_Footswitch	KEYWORD1
+HPCB_Led	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+Init	KEYWORD2
+StartAudio	KEYWORD2
+StopAudio	KEYWORD2
+Idle	KEYWORD2
+
+SampleRate	KEYWORD2
+BlockSize	KEYWORD2
+SetLevel	KEYWORD2
+SetInputMode	KEYWORD2
+GetInputMode	KEYWORD2
+
+ReadPot	KEYWORD2
+ReadPotMapped	KEYWORD2
+ReadPotSmoothed	KEYWORD2
+ReadToggle	KEYWORD2
+
+FootswitchIsPressed	KEYWORD2
+FootswitchIsReleased	KEYWORD2
+FootswitchIsLongPressed	KEYWORD2
+FootswitchIsDoublePressed	KEYWORD2
+FootswitchIsDoubleLongPressed	KEYWORD2
+
+SetFootswitchTiming	KEYWORD2
+SetDebounce	KEYWORD2
+SetLongPress	KEYWORD2
+SetMultiClickGap	KEYWORD2
+
+SetLED	KEYWORD2
+Connect	KEYWORD2
+to_master	KEYWORD2
+level	KEYWORD2
