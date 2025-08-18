@@ -44,7 +44,9 @@
 //   float    = a box that can hold decimals
 
 // -----------------------------------------------------------------------------
-// CONSTANTS
+// CONSTANTS (These will never change, hence the name.  
+//            static inside a function means the variable will
+//            exist before and after the function has executed.)
 // -----------------------------------------------------------------------------
 static const uint32_t SAMPLE_RATE_HZ = 48000; // 48,000 slices per second
 static const uint16_t BLOCK_SIZE     = 8;     // Work on 8 slices at a time
