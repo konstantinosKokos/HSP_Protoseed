@@ -99,13 +99,10 @@ cd HSP_Protoseed
 
 4. Put the Daisy Seed into DFU (bootloader) mode
 
-Unplug USB.
 
 Hold down the BOOT button on the Seed.
 
-While holding BOOT, plug in USB.
-
-Quickly tap the RESET button once, then release BOOT.
+While holding BOOT, press the RESET button once, then release BOOT.
 
 The Seed is now waiting for firmware (LED will be dim).
 
