@@ -1,261 +1,269 @@
-// BasicLEDSoftClip.ino — v1.0.1 (beginner‑friendly names + detailed clip comments)
+// HSP_BasicLEDSoftClip.ino — v1.0.1 (textbook-style, friendly guide)
 // by Harold Street Pedals 2025
-// LED-style soft clipping (op-amp feedback style) with drive, tone, symmetry, and bypass.
+//
+// LED‑style SOFT clipping (op‑amp feedback flavor) with Drive, Tone, Symmetry,
+// momentary Kick, and true bypass. Post‑effect Master handled by the library.
+//
+// Signal path: Input → Drive → SoftClip (tanh, asym) → Tone LPF → Master → Output
 
 #include <HaroldPCB.h>
-#include <math.h>
 
 // -----------------------------------------------------------------------------
-// CONSTANTS (tweakable defaults for builders)
+// Constants (tunable parameters for builders / tinkerers)
 // -----------------------------------------------------------------------------
-static const uint32_t SAMPLE_RATE_HZ = 48000;
-static const uint16_t BLOCK_SIZE = 8;
+static const uint32_t SAMPLE_RATE_HZ = 48000;  // fixed project-wide
+static const uint16_t BLOCK_SIZE = 8;          // fixed project-wide
 
-// DRIVE: pre-gain before saturation (in dB)
+// DRIVE: pre‑gain before saturation (in dB)
 static const float DRIVE_MIN_DB = 0.0f;   // unity
 static const float DRIVE_MAX_DB = 36.0f;  // ~63x linear
 
-// MOMENTARY KICK (FS1): extra drive when held
+// MOMENTARY KICK (FS1): extra drive while held
 static const float EXTRA_DRIVE_DB = 6.0f;
 
 // “LED feel” threshold (softer than hard clip)
-static const float CLIP_THR_SOFT = 0.40f;  // softness center scaling
+// Think of this as a "bendiness" scale for positive/negative sides.
+static const float CLIP_THR_SOFT = 0.40f;  // mid softness
 
 // Symmetry skew range (RV3) — ±45% between positive/negative
 static const float SYM_RANGE_FRAC = 0.45f;
 
-// TONE: one-pole low-pass (post saturation)
+// TONE: one‑pole low‑pass (post saturation)
 static const float TONE_CUTOFF_MIN_HZ = 600.0f;
 static const float TONE_CUTOFF_MAX_HZ = 8200.0f;
 
-// Output trim + safety
+// Output trim + safety limit
 static const float OUTPUT_TRIM = 1.0f;
 static const float OUT_LIMIT = 1.2f;
 
-// LED indicator decay
+// LED indicator decay (simple envelope for "clipping happened" light)
 static const float CLIP_LED_DECAY = 0.90f;
 
 // -----------------------------------------------------------------------------
-// GLOBAL STATE
+// Global state
 // -----------------------------------------------------------------------------
 static HaroldPCB H;
 
-// cached control state for the audio thread
-static volatile bool bypassOn = false;
-static volatile bool kickOn = false;
-static volatile float driveAmount = 1.0f;
-static volatile float clipLimitPositive = CLIP_THR_SOFT;
-static volatile float clipLimitNegative = CLIP_THR_SOFT;
+// Cached control state for audio thread
+static volatile bool g_bypassed = false;
+static volatile bool g_kick = false;
+static volatile float g_drive_lin = 1.0f;
+static volatile float g_thr_pos = CLIP_THR_SOFT;
+static volatile float g_thr_neg = CLIP_THR_SOFT;
+static volatile float g_lp_a = 0.0f;  // tone LPF 'a'
+static volatile float g_lp_b = 1.0f;  // (1 - a)
 
-// one-pole low-pass coefficients (tone)
-static volatile float lowpassCoef_A = 0.0f;
-static volatile float lowpassCoef_B = 1.0f;
+// Filter memory
+static float lpMemory = 0.0f;
 
-// low-pass memory (state)
-static float lowpassMemory = 0.0f;
-
-// clip indicator envelope
-static volatile bool clipFlag = false;
+// Clip indicator (control thread owns LED fade)
+static volatile bool g_clip_flag = false;
 static float clipEnvelope = 0.0f;
 
 // FS2 edge detect
-static bool prevBypassSwitch = false;
+static bool prev_fs2 = false;
 
 // -----------------------------------------------------------------------------
-// HELPERS
+// Helpers
 // -----------------------------------------------------------------------------
 static inline float dB_to_lin(float db) {
-  // Convert decibels to linear gain: 20 dB → 10x, 6 dB → ~2x, etc.
-  return powf(10.0f, db / 20.0f);
+  return powf(10.0f, db * (1.0f / 20.0f));
 }
 
+// One‑pole low‑pass coefficient update (post‑tone)
+// y[n] = b*x[n] + a*y[n-1], a = exp(-2*pi*fc/fs), b = 1 - a
 static void UpdateLowpassFromCutoff(float cutoffHz) {
-  // Protect from extremes and set a simple 1-pole low-pass (post-clip tone).
-  cutoffHz = fmaxf(10.0f, fminf(cutoffHz, SAMPLE_RATE_HZ * 0.45f));
-  float a = expf(-2.0f * M_PI * cutoffHz / SAMPLE_RATE_HZ);
-  lowpassCoef_A = a;
-  lowpassCoef_B = 1.0f - a;
-}
-
-// Soft clipper (LED feedback style).
-// Uses tanh() with separate positive/negative “limits” to mimic LED forward voltages.
-// If input exceeds either limit, we mark that a clip happened (for the LED).
-static inline float SoftClipAsym(float input, float limitPos, float limitNeg, bool &clipped) {
-  float result = 0.0f;
-  if (input >= 0.0f) {
-    result = limitPos * tanhf(input / limitPos);
-    if (fabsf(input) > limitPos) clipped = true;
-  } else {
-    result = limitNeg * tanhf(input / limitNeg);
-    if (fabsf(input) > limitNeg) clipped = true;
-  }
-  return result;
+  float safeCutoff = fmaxf(10.0f, fminf(cutoffHz, SAMPLE_RATE_HZ * 0.45f));
+  float a = expf(-2.0f * (float)M_PI * safeCutoff / (float)SAMPLE_RATE_HZ);
+  g_lp_a = a;
+  g_lp_b = 1.0f - a;
 }
 
 // -----------------------------------------------------------------------------
-// AUDIO CALLBACK (runs very fast, one tiny slice of sound at a time)
+// SOFT CLIPPER (LED feedback style) — heavily commented
+// -----------------------------------------------------------------------------
+// What it does (plain English):
+// • We want that "LED in the feedback path" feel: instead of slicing the top off
+//   flat (hard clip), we BEND toward a ceiling smoothly.
+// • We use tanh() because it bends gently as the input gets bigger.
+// • Real pedals can clip differently on + and – (diode forward drops, bias, etc).
+//   We model that by giving the positive and negative sides their own "softness"
+//   numbers (thr_pos, thr_neg). Smaller threshold = bends sooner = more grit.
+//
+// How it works (step by step):
+// 1) Look at the sign of the input sample.
+// 2) Choose the threshold for that side (thr_pos for +, thr_neg for –).
+// 3) Divide by that threshold so tanh() "feels" where to bend.
+// 4) Multiply back by the threshold so the overall output level makes sense.
+// 5) If the input magnitude is bigger than the threshold, we mark "clipped" so
+//    the LED can show activity.
+//
+// Inputs:
+//   x          — the pre‑gained audio sample
+//   thr_pos    — softness scale for positive side
+//   thr_neg    — softness scale for negative side
+//   clipped    — output flag we set to true if bending is happening clearly
+//
+// Output:
+//   y — the softly bent version of x
+static inline float SoftClipAsym(float x, float thr_pos, float thr_neg, bool &clipped) {
+  float y = 0.0f;
+
+  if (x >= 0.0f) {
+    float bendAmount = x / thr_pos;   // how close we are to the bend zone on +
+    y = thr_pos * tanhf(bendAmount);  // bend smoothly, then scale back up
+    if (fabsf(x) > thr_pos) clipped = true;
+  } else {
+    float bendAmount = x / thr_neg;  // how close we are to the bend zone on –
+    y = thr_neg * tanhf(bendAmount);
+    if (fabsf(x) > thr_neg) clipped = true;
+  }
+
+  return y;
+}
+
+// -----------------------------------------------------------------------------
+// Audio callback (audio thread only — NO direct reads of knobs/switches)
 // -----------------------------------------------------------------------------
 void AudioCB(float in, float &out) {
-  if (bypassOn) {
-    out = in;  // If bypass is ON, skip processing entirely.
+  if (g_bypassed) {
+    out = in;  // true bypass
     return;
   }
 
-  // ------------------------------
-  // DRIVE STAGE (Pre-Gain)
-  // ------------------------------
-  // Turn the guitar signal up before clipping.
-  // - driveAmount comes from the Drive knob (RV1).
-  // - kickOn adds extra gain while FS1 is held for a momentary "boost".
-  float preGain = driveAmount * (kickOn ? dB_to_lin(EXTRA_DRIVE_DB) : 1.0f);
-  float drivenSignal = in * preGain;  // louder input ready to distort
+  // 1) Pre‑gain (Drive) + optional Kick
+  float driveBoost = g_drive_lin * (g_kick ? dB_to_lin(EXTRA_DRIVE_DB) : 1.0f);
+  float driven = in * driveBoost;
 
-  // ------------------------------
-  // CLIPPING STAGE (LED-style soft clip)
-  // ------------------------------
-  // What is clipping?
-  // - Imagine the waveform is a wiggly line. If we push it too high, it “hits the ceiling”.
-  //   Hard clipping chops the top flat (like scissors). That sounds aggressive and fizzy.
-  // - Soft clipping bends the top smoothly (like pressing clay). That sounds smoother and more amp-like.
-  //
-  // How do we soft-clip here?
-  // - We use the tanh() math curve, which naturally bends as values grow.
-  // - We give tanh() two “limits”: one for positive half-waves and one for negative.
-  //   This lets us skew the shape (asymmetry) so the + and – sides can behave a bit differently,
-  //   similar to how two different LEDs would conduct at slightly different forward voltages.
-  //
-  // What lights the LED?
-  // - If the incoming signal goes beyond either limit, we set a flag.
-  //   The control thread (loop) turns that into a short “glow” on LED1,
-  //   so you can see when the clipper is working.
-  bool clipped = false;
-  float clippedSignal = SoftClipAsym(drivenSignal,
-                                     clipLimitPositive,
-                                     clipLimitNegative,
-                                     clipped);
-  if (clipped) {
-    clipFlag = true;  // Tell the LED system that a clip just happened.
-  }
+  // 2) Soft clip (LED feedback style) with asymmetry
+  bool clippedNow = false;
+  float bent = SoftClipAsym(driven, g_thr_pos, g_thr_neg, clippedNow);
+  if (clippedNow) g_clip_flag = true;
 
-  // ------------------------------
-  // TONE STAGE (Low-Pass Filter)
-  // ------------------------------
-  // After clipping, high treble can get harsh.
-  // A simple low-pass filter gently rolls off highs for a smoother tone.
-  // (We’ll go deeper on filters later in the textbook.)
-  lowpassMemory = lowpassCoef_B * clippedSignal + lowpassCoef_A * lowpassMemory;
-  float filteredSignal = lowpassMemory;
+  // 3) Post‑TONE LPF (brief here; full filter lessons later)
+  //    One‑pole treble cut controlled by RV2 (via cutoff → g_lp_a/g_lp_b)
+  lpMemory = g_lp_b * bent + g_lp_a * lpMemory;
+  float toned = lpMemory;
 
-  // ------------------------------
-  // OUTPUT STAGE
-  // ------------------------------
-  // Final trim and safety limiter so we don’t exceed a chosen ceiling.
-  filteredSignal *= OUTPUT_TRIM;
-  filteredSignal = fmaxf(-OUT_LIMIT, fminf(filteredSignal, OUT_LIMIT));
+  // 4) Output trim + safety limit
+  float limited = fmaxf(-OUT_LIMIT, fminf(toned * OUTPUT_TRIM, OUT_LIMIT));
 
-  out = filteredSignal;
+  out = limited;
 }
 
 // -----------------------------------------------------------------------------
-// SETUP (runs once at power-up)
+// Setup (runs once)
 // -----------------------------------------------------------------------------
 void setup() {
   H.Init(SAMPLE_RATE_HZ, BLOCK_SIZE);
 
-  // RV1: Drive → convert dB range to linear gain for the audio thread
-  driveAmount = dB_to_lin(H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10));
+  // Initial control state from hardware
+  g_drive_lin = dB_to_lin(H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10));
 
-  // RV2: Tone cutoff → set initial low-pass coefficients
-  float toneStart = H.ReadPotMapped(RV2, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
-  UpdateLowpassFromCutoff(toneStart);
+  float initialCutoff = H.ReadPotMapped(RV2, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
+  UpdateLowpassFromCutoff(initialCutoff);
 
-  // RV3: Symmetry skew → shift positive/negative limits
-  float rawSym = H.ReadPot(RV3) * 2.0f - 1.0f;  // 0..1 to -1..+1
-  float skew = rawSym * SYM_RANGE_FRAC;         // shrink to our chosen range
-  clipLimitPositive = fmaxf(0.05f, CLIP_THR_SOFT * (1.0f + skew));
-  clipLimitNegative = fmaxf(0.05f, CLIP_THR_SOFT * (1.0f - skew));
+  // RV3 — Symmetry skew (±) maps to different thresholds for + and –
+  {
+    float knobPosition = H.ReadPot(RV3) * 2.0f - 1.0f;  // -1..+1
+    float skew = knobPosition * SYM_RANGE_FRAC;
+    g_thr_pos = fmaxf(0.05f, CLIP_THR_SOFT * (1.0f + skew));
+    g_thr_neg = fmaxf(0.05f, CLIP_THR_SOFT * (1.0f - skew));
+  }
 
-  // RV6: initial master level (library also supports smoothing in loop)
+  // Master (post) from RV6
   H.SetLevel(H.ReadPot(RV6));
 
-  // Start audio with our processing function
   H.StartAudio(AudioCB);
 }
 
 // -----------------------------------------------------------------------------
-// LOOP (runs repeatedly, human-speed control work)
+// Loop (control/UI; not in audio time)
 // -----------------------------------------------------------------------------
 void loop() {
-  // RV1: Drive (read knob, map dB → linear)
-  driveAmount = dB_to_lin(H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10));
+  // IMPORTANT: services pots/toggles/footswitch debounce in v1.3.0
+  H.Idle();
 
-  // RV2: Tone cutoff (update one-pole low-pass)
-  float cutoff = H.ReadPotMapped(RV2, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
-  UpdateLowpassFromCutoff(cutoff);
-
-  // RV3: Symmetry skew (recompute clip limits)
-  float rawSym = H.ReadPot(RV3) * 2.0f - 1.0f;
-  float skew = rawSym * SYM_RANGE_FRAC;
-  clipLimitPositive = fmaxf(0.05f, CLIP_THR_SOFT * (1.0f + skew));
-  clipLimitNegative = fmaxf(0.05f, CLIP_THR_SOFT * (1.0f - skew));
-
-  // RV6: Master level (smooth when engaged, unity when bypassed)
-  H.SetLevel(bypassOn ? 1.0f : H.ReadPotSmoothed(RV6, 15.0f));
-
-  // FS1: Kick (momentary extra drive)
-  kickOn = H.FootswitchIsPressed(FS1);
-
-  // FS2: Bypass toggle (edge-detected)
-  bool bypassSwitch = H.FootswitchIsPressed(FS2);
-  if (bypassSwitch && !prevBypassSwitch) {
-    bypassOn = !bypassOn;
+  // RV1 — Drive (dB → linear)
+  {
+    float knobPosition = H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10);
+    g_drive_lin = dB_to_lin(knobPosition);
   }
-  prevBypassSwitch = bypassSwitch;
+
+  // RV2 — Tone cutoff (maps to LPF coefficients)
+  {
+    float cutoffHz = H.ReadPotMapped(RV2, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
+    UpdateLowpassFromCutoff(cutoffHz);
+  }
+
+  // RV3 — Symmetry (skews positive/negative softness)
+  {
+    float knobPosition = H.ReadPot(RV3) * 2.0f - 1.0f;  // -1..+1
+    float skew = knobPosition * SYM_RANGE_FRAC;
+    g_thr_pos = fmaxf(0.05f, CLIP_THR_SOFT * (1.0f + skew));
+    g_thr_neg = fmaxf(0.05f, CLIP_THR_SOFT * (1.0f - skew));
+  }
+
+  // RV6 — Master level (post)
+  {
+    float masterKnob = H.ReadPotSmoothed(RV6, 15.0f);  // mild smoothing for fine control
+    if (!g_bypassed) {
+      H.SetLevel(masterKnob);  // when engaged, knob controls master
+    } else {
+      H.SetLevel(1.0f);  // when bypassed, force unity passthrough
+    }
+  }
+
+  // FS1 — Kick (momentary extra drive)
+  g_kick = H.FootswitchIsPressed(FS1);
+
+  // FS2 — Bypass toggle (edge detect)
+  {
+    bool fs2 = H.FootswitchIsPressed(FS2);
+    if (fs2 && !prev_fs2) g_bypassed = !g_bypassed;
+    prev_fs2 = fs2;
+  }
 
   // LEDs
-  H.SetLED(LED2, !bypassOn);  // LED2 = effect active
-  if (clipFlag) {
-    clipEnvelope = 1.0f;  // pop the envelope to full when we detect a clip
-    clipFlag = false;
+  H.SetLED(LED2, !g_bypassed);  // Effect active indicator
+
+  // Clip LED envelope (lights when bendy stuff happened recently)
+  if (g_clip_flag) {
+    clipEnvelope = 1.0f;
+    g_clip_flag = false;
   }
   clipEnvelope *= CLIP_LED_DECAY;
-  H.SetLED(LED1, clipEnvelope > 0.12f || kickOn);  // LED1 = clip (or kick) indicator
+  H.SetLED(LED1, clipEnvelope > 0.12f || g_kick);  // show clipping or Kick
 }
 
 // -----------------------------------------------------------------------------
-// USER GUIDE
+// User Guide
 // -----------------------------------------------------------------------------
 //
 // Overview
 // --------
-// LED-style soft clipping with Drive, Tone, Symmetry, and Bypass.
-// Smooth “bend” (tanh) instead of a hard cutoff, for a more musical feel.
+// This pedal models **LED soft clipping** (as in an op‑amp feedback path). Instead
+// of chopping flat, the curve bends smoothly (tanh). You can bias symmetry so the
+// + and – halves bend differently, which changes the feel and harmonics. A simple
+// post‑LPF “Tone” trims treble. FS1 adds a momentary drive “Kick”. FS2 toggles a
+// true bypass path. RV6 sets post‑effect level via the library.
 //
 // Controls
 // --------
-// - RV1 — Drive: 0 to +36 dB pre-gain.
-// - RV2 — Tone: 600 Hz – 8.2 kHz treble roll-off (simple low-pass).
-// - RV3 — Symmetry: skews positive vs negative clipping thresholds.
-// - RV6 — Master: overall level after tone.
-// - FS1 — Kick: hold for +6 dB extra drive.
-// - FS2 — Bypass toggle.
-// - LED1 — Clip indicator (brief glow on clip; also on while Kick is held).
+// - RV1 — Drive: 0 to +36 dB pre‑gain (use HPCB_Curve::Exp10 mapping).
+// - RV2 — Tone: low‑pass cutoff (600 Hz → 8.2 kHz).
+// - RV3 — Symmetry: skews positive/negative bend amount.
+// - RV6 — Master: overall output level (post).
+// - FS1 — Kick: hold for +6 dB extra pre‑gain.
+// - FS2 — Bypass: toggles clean passthrough.
+// - LED1 — Clip/Kick indicator (envelope decay).
 // - LED2 — Effect active.
-//
-// Signal Flow
-// -----------
-// Input → Drive → SoftClip (tanh, asym) → Low-Pass Tone → Master → Output
-//
-// Tweak Points
-// ------------
-// - DRIVE_MIN_DB / DRIVE_MAX_DB: set the pre-gain window.
-// - CLIP_THR_SOFT: smaller = more distortion.
-// - SYM_RANGE_FRAC: how far symmetry can skew.
-// - TONE_CUTOFF_MIN/MAX: tone control’s range.
-// - EXTRA_DRIVE_DB: Kick boost amount.
 //
 // Notes
 // -----
-// We kept math names readable (English words) for beginners,
-// and we’ll dig deeper into filter design in the later “Filters” chapter.
+// • Clipping section is thoroughly commented above.
+// • Tone is a 1‑pole LPF here for clarity; we’ll dive deeper into filter designs
+//   in the dedicated “Filters” chapter.
+// • Adjust CLIP_THR_SOFT for softer/harder bending; tweak SYM_RANGE_FRAC for
+//   stronger/weaker asymmetry; push DRIVE_MAX_DB for wilder saturation.
 //
