@@ -1,18 +1,18 @@
-// BasicBJT.ino — v1.0.0
+// BasicBJT.ino — v1.0.2
 // by Harold Street Pedals 2025
 // BJT-style distortion using an exponential (diode-equation) soft clip,
 // with drive, bias/asymmetry, tone, momentary kick, and true bypass.
-// LEDs are active-HIGH (HaroldPCB v1.3.0+): SetLED(..., true) turns the LED on.
 
 #include <HaroldPCB.h>
+#include <math.h>
 
 // -----------------------------------------------------------------------------
-// Constants (tunable parameters for builders / tinkerers / nerds)
+// CONSTANTS (tweakable builder settings)
 // -----------------------------------------------------------------------------
 static const uint32_t SAMPLE_RATE_HZ = 48000;  // fixed project-wide
 static const uint16_t BLOCK_SIZE = 8;          // fixed project-wide
 
-// DRIVE (pre-gain in dB) — how hard we push into the BJT nonlinearity
+// DRIVE (pre-gain in dB) — how hard we push into the BJT-like nonlinearity
 static const float DRIVE_MIN_DB = 0.0f;   // unity
 static const float DRIVE_MAX_DB = 36.0f;  // ~63x linear
 
@@ -20,18 +20,19 @@ static const float DRIVE_MAX_DB = 36.0f;  // ~63x linear
 static const float EXTRA_DRIVE_DB = 6.0f;
 
 // BJT / diode-equation shaper parameters
-// We approximate IE ≈ Is*(exp(Vd/Vt)-1). Use scaling to keep things stable in -1..+1.
-// Vt sets curve steepness; smaller = sharper knee (more aggressive).
+// Approx: IE ≈ Is * (exp(Vd/Vt) - 1).
+// Vt sets curve steepness; smaller Vt => sharper knee (more aggressive).
 static const float Vt_MIN = 0.20f;
 static const float Vt_MAX = 0.60f;
+
 // Output scaling after the diode mapping so nominal gain stays in range
 static const float SHAPER_GAIN = 1.0f;
 
-// Asymmetry control (RV3) blends different positive/negative "Vt" to mimic BJT odd bias.
+// Asymmetry (RV3) blends different positive/negative "Vt" to mimic BJT bias mismatch.
 // SYM_RANGE_FRAC = how far ± we move Vt for + vs - sides.
 static const float SYM_RANGE_FRAC = 0.45f;
 
-// DC bias (pre-shaper) range to push asymmetry, similar to shifting operating point
+// DC bias (pre-shaper) range to shift the operating point for asymmetry textures
 static const float BIAS_RANGE = 0.25f;  // ±0.25 added to input before shaping
 
 // Post-TONE: one-pole treble-cut after the shaper
@@ -47,235 +48,243 @@ static const float CLIP_LED_ATTACK = 1.00f;
 static const float CLIP_LED_DECAY = 0.90f;
 
 // -----------------------------------------------------------------------------
-// Global state
+// GLOBAL STATE
 // -----------------------------------------------------------------------------
 static HaroldPCB H;
 
-// Cached control state (updated in loop(), consumed in AudioCB)
-static volatile bool g_bypassed = false;
-static volatile bool g_kick = false;
-static volatile float g_drive_lin = 1.0f;
-static volatile float g_Vt_pos = 0.35f;  // effective Vt for positive half
-static volatile float g_Vt_neg = 0.35f;  // effective Vt for negative half
-static volatile float g_bias = 0.0f;
-static volatile float g_lp_a = 0.0f;  // tone LPF 'a'
-static volatile float g_lp_b = 1.0f;  // (1 - a)
+// Cached control state (updated in loop(), used in AudioCB)
+static volatile bool bypassOn = false;
+static volatile bool kickOn = false;
+static volatile float driveAmount = 1.0f;
+static volatile float curveVtPositive = 0.35f;  // effective Vt for + half
+static volatile float curveVtNegative = 0.35f;  // effective Vt for - half
+static volatile float dcBias = 0.0f;
 
-// Filter memory
-static float g_lp_z = 0.0f;
+// One-pole low-pass tone coefficients: y[n] = B*x[n] + A*y[n-1]
+// A = exp(-2*pi*fc/fs), B = 1 - A
+static volatile float lowpassCoef_A = 0.0f;
+static volatile float lowpassCoef_B = 1.0f;
+
+// Low-pass memory (previous output y[n-1])
+static float lowpassMemory = 0.0f;
 
 // Clip indicator envelope
-static float g_clip_env = 0.0f;
+static float clipEnvelope = 0.0f;
 
-// FS2 edge tracking
-static bool prev_fs2 = false;
+// FS2 edge tracking for bypass toggle
+static bool prevBypassSwitch = false;
 
 // -----------------------------------------------------------------------------
-// Helpers
+// HELPERS
 // -----------------------------------------------------------------------------
 static inline float dB_to_lin(float db) {
-  return powf(10.0f, db * (1.0f / 20.0f));
+  return powf(10.0f, db / 20.0f);
 }
 
 // One-pole low-pass coefficient update (post-tone)
-// y[n] = b*x[n] + a*y[n-1], a = exp(-2*pi*fc/fs), b = 1 - a
-static void UpdateLowpassFromCutoff(float fc_hz) {
-  fc_hz = fmaxf(10.0f, fminf(fc_hz, SAMPLE_RATE_HZ * 0.45f));
-  float a = expf(-2.0f * (float)M_PI * fc_hz / (float)SAMPLE_RATE_HZ);
-  g_lp_a = a;
-  g_lp_b = 1.0f - a;
+static void UpdateLowpassFromCutoff(float cutoffHz) {
+  cutoffHz = fmaxf(10.0f, fminf(cutoffHz, SAMPLE_RATE_HZ * 0.45f));
+  float A = expf(-2.0f * (float)M_PI * cutoffHz / (float)SAMPLE_RATE_HZ);
+  lowpassCoef_A = A;
+  lowpassCoef_B = 1.0f - A;
 }
 
-// Diode-like soft clip with independent positive/negative steepness (Vt_pos/Vt_neg)
-// We use a signed mapping: y = sign(xp) * (1 - exp(-|xp|/Vt_side)), with xp = x + bias
-// Then scale with SHAPER_GAIN. 'clipped' flags when the curve is clearly nonlinear.
-static inline float BJT_DiodeSoftClip(float x, float Vt_pos, float Vt_neg, float bias, bool &clipped) {
-  float xp = x + bias;
-  float a = fabsf(xp);
-  float Vt = (xp >= 0.0f) ? Vt_pos : Vt_neg;
-  Vt = fmaxf(0.05f, Vt);
+// Diode-like soft clip with independent positive/negative steepness (Vt+ / Vt-).
+// Mapping (signed): y = sign(xp) * (1 - exp(-|xp| / Vt_side)), with xp = input + dcBias.
+// Then scaled by SHAPER_GAIN. We set 'clipped' when the curve is clearly bending.
+static inline float BJT_DiodeSoftClip(float input,
+                                      float Vt_pos,
+                                      float Vt_neg,
+                                      float bias,
+                                      bool &clipped) {
+  float shiftedInput = input + bias;  // move the waveform left/right (DC bias)
+  float magnitude = fabsf(shiftedInput);
+  float VtSide = (shiftedInput >= 0.0f) ? Vt_pos : Vt_neg;
+  VtSide = fmaxf(0.05f, VtSide);  // safety floor
 
-  // Soft knee: approaches ±1 as input grows
-  float y_uni = 1.0f - expf(-a / Vt);
-  float y = copysignf(y_uni, xp) * SHAPER_GAIN;
+  // Soft knee: approaches ±1 as input grows, but bends smoothly (exponential)
+  float uni = 1.0f - expf(-magnitude / VtSide);
+  float shaped = copysignf(uni, shiftedInput) * SHAPER_GAIN;
 
-  // simple heuristic to drive LED: if |xp| is big enough vs Vt
-  if (a > 0.6f * Vt) clipped = true;
-  return y;
+  // Heuristic for the clip LED: “far into the bend region”
+  if (magnitude > 0.6f * VtSide) clipped = true;
+
+  return shaped;
 }
 
 // -----------------------------------------------------------------------------
-// Audio callback (runs at audio rate). No control reads here.
+// AUDIO CALLBACK (runs very fast, one tiny slice of sound at a time)
 // -----------------------------------------------------------------------------
 void AudioCB(float in, float &out) {
-  if (g_bypassed) {
-    out = in;
+  if (bypassOn) {
+    out = in;  // true bypass: just pass the sound through
     return;
   }
 
-  // 1) Pre-gain (with momentary kick)
-  float pre = in * g_drive_lin * (g_kick ? dB_to_lin(EXTRA_DRIVE_DB) : 1.0f);
+  // ------------------------------
+  // 1) DRIVE STAGE (Pre‑Gain)
+  // ------------------------------
+  // Turn the guitar signal up before we distort it.
+  // driveAmount from RV1; EXTRA_DRIVE_DB kicks in while FS1 held.
+  float preGain = driveAmount * (kickOn ? dB_to_lin(EXTRA_DRIVE_DB) : 1.0f);
+  float drivenSignal = in * preGain;
 
-  // 2) BJT/diode soft clip with bias + asymmetry
-  bool clipped = false;
-  float y = BJT_DiodeSoftClip(pre, g_Vt_pos, g_Vt_neg, g_bias, clipped);
+  // ------------------------------
+  // 2) CLIPPING STAGE (BJT‑style, diode equation flavor)
+  // ------------------------------
+  // What: bend the waveform with an exponential curve.
+  // How:  y = sign(x+bias) * (1 - exp(-|x+bias| / Vt_side)) * SHAPER_GAIN
+  //       Vt_side = Vt+ (for +), Vt- (for -)
+  // Why:  exponential rise mimics a transistor junction; two Vt’s give asymmetry.
+  bool clippedNow = false;
+  float shapedSignal = BJT_DiodeSoftClip(drivenSignal,
+                                         curveVtPositive,
+                                         curveVtNegative,
+                                         dcBias,
+                                         clippedNow);
+  if (clippedNow) {
+    // brief “pop” into an envelope, decay handled in loop()
+    clipEnvelope = fminf(1.0f, CLIP_LED_ATTACK * (clipEnvelope + 0.30f));
+  }
 
-  // 3) Post Tone LPF
-  g_lp_z = g_lp_b * y + g_lp_a * g_lp_z;
-  y = g_lp_z;
+  // ------------------------------
+  // 3) TONE STAGE (Low‑Pass Filter)
+  // ------------------------------
+  // What: gently reduce treble after distortion.
+  // How:  1‑pole LPF: y[n] = B*x[n] + A*y[n-1], A=exp(-2πfc/fs), B=1−A
+  lowpassMemory = lowpassCoef_B * shapedSignal + lowpassCoef_A * lowpassMemory;
+  float filtered = lowpassMemory;
 
-  // 4) Output trim + safety
-  y *= OUTPUT_TRIM;
-  y = fmaxf(-OUT_LIMIT, fminf(y, OUT_LIMIT));
+  // ------------------------------
+  // 4) OUTPUT STAGE
+  // ------------------------------
+  // Trim and clamp to a safe ceiling.
+  filtered *= OUTPUT_TRIM;
+  filtered = fmaxf(-OUT_LIMIT, fminf(filtered, OUT_LIMIT));
 
-  // Clip LED envelope
-  if (clipped) g_clip_env = fminf(1.0f, CLIP_LED_ATTACK * (g_clip_env + 0.30f));
-
-  out = y;
+  out = filtered;
 }
 
 // -----------------------------------------------------------------------------
-// Setup (runs once)
+// SETUP (runs once)
 // -----------------------------------------------------------------------------
 void setup() {
   H.Init(SAMPLE_RATE_HZ, BLOCK_SIZE);
 
-  // Initial params from pots
-  g_drive_lin = dB_to_lin(H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10));
+  // RV1 — Drive (dB → linear)
+  driveAmount = dB_to_lin(H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10));
 
-  // RV2 as "character": map to Vt (steepness). Lower Vt = harder clipping.
+  // RV2 — Character (Vt), RV3 — Asymmetry (skews Vt+ vs Vt-)
   {
-    float Vt = H.ReadPotMapped(RV2, Vt_MIN, Vt_MAX, HPCB_Curve::Exp10);
-    // RV3 adds asymmetry by skewing Vt+ vs Vt-
-    float r = H.ReadPot(RV3) * 2.0f - 1.0f;  // -1..+1
-    float skew = r * SYM_RANGE_FRAC;
-    g_Vt_pos = fmaxf(0.05f, Vt * (1.0f - skew));
-    g_Vt_neg = fmaxf(0.05f, Vt * (1.0f + skew));
+    float vtBase = H.ReadPotMapped(RV2, Vt_MIN, Vt_MAX, HPCB_Curve::Exp10);
+    float rawAsym = H.ReadPot(RV3) * 2.0f - 1.0f;  // -1..+1
+    float skew = rawAsym * SYM_RANGE_FRAC;
+    curveVtPositive = fmaxf(0.05f, vtBase * (1.0f - skew));
+    curveVtNegative = fmaxf(0.05f, vtBase * (1.0f + skew));
   }
 
-  // RV4 adds DC bias pre-shaper (±BIAS_RANGE)
+  // RV4 — DC Bias (±BIAS_RANGE) pre-shaper
   {
-    float b01 = H.ReadPot(RV4) * 2.0f - 1.0f;
-    g_bias = b01 * BIAS_RANGE;
+    float rawBias = H.ReadPot(RV4) * 2.0f - 1.0f;  // -1..+1
+    dcBias = rawBias * BIAS_RANGE;
   }
 
-  // RV5 post Tone LPF cutoff
+  // RV5 — Tone cutoff (LPF)
   {
-    float fc0 = H.ReadPotMapped(RV5, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
-    UpdateLowpassFromCutoff(fc0);
+    float cutoff0 = H.ReadPotMapped(RV5, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
+    UpdateLowpassFromCutoff(cutoff0);
   }
 
-  // Master (post)
+  // RV6 — Master (post)
   H.SetLevel(H.ReadPot(RV6));
 
   H.StartAudio(AudioCB);
 }
 
 // -----------------------------------------------------------------------------
-// Loop (controls/UI; not in audio time)
+// LOOP (controls/UI; not in audio time)
 // -----------------------------------------------------------------------------
 void loop() {
+  // Library housekeeping (debounce, footswitch/toggle service, etc.)
   H.Idle();
 
   // RV1 — Drive (dB → linear)
-  g_drive_lin = dB_to_lin(H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10));
+  driveAmount = dB_to_lin(H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10));
 
-  // RV2 — Vt (curve steepness) + RV3 asymmetry skew
+  // RV2 — Vt (curve steepness) + RV3 — Asymmetry skew
   {
-    float Vt = H.ReadPotMapped(RV2, Vt_MIN, Vt_MAX, HPCB_Curve::Exp10);
-    float r = H.ReadPot(RV3) * 2.0f - 1.0f;  // -1..+1
-    float skew = r * SYM_RANGE_FRAC;
-    g_Vt_pos = fmaxf(0.05f, Vt * (1.0f - skew));
-    g_Vt_neg = fmaxf(0.05f, Vt * (1.0f + skew));
+    float vtBase = H.ReadPotMapped(RV2, Vt_MIN, Vt_MAX, HPCB_Curve::Exp10);
+    float rawAsym = H.ReadPot(RV3) * 2.0f - 1.0f;  // -1..+1
+    float skew = rawAsym * SYM_RANGE_FRAC;
+    curveVtPositive = fmaxf(0.05f, vtBase * (1.0f - skew));
+    curveVtNegative = fmaxf(0.05f, vtBase * (1.0f + skew));
   }
 
   // RV4 — DC bias (±BIAS_RANGE)
   {
-    float b01 = H.ReadPot(RV4) * 2.0f - 1.0f;
-    g_bias = b01 * BIAS_RANGE;
+    float rawBias = H.ReadPot(RV4) * 2.0f - 1.0f;
+    dcBias = rawBias * BIAS_RANGE;
   }
 
-  // RV5 — Tone cutoff
+  // RV5 — Tone cutoff (update one-pole LPF)
   {
-    float fc = H.ReadPotMapped(RV5, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
-    UpdateLowpassFromCutoff(fc);
+    float cutoff = H.ReadPotMapped(RV5, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
+    UpdateLowpassFromCutoff(cutoff);
   }
 
-  // RV6 — Master (post), mild smoothing for fine control
-  if (!g_bypassed) {
-    H.SetLevel(H.ReadPotSmoothed(RV6, 15.0f));  // Don't read pot if bypassed,
-  } else {
-    H.SetLevel(1.0f);  // instead set unity gain.
-  }
+  // RV6 — Master (post). Smooth when engaged; unity when bypassed.
+  H.SetLevel(bypassOn ? 1.0f : H.ReadPotSmoothed(RV6, 15.0f));
 
   // FS1 — Kick (momentary)
-  g_kick = H.FootswitchIsPressed(FS1);
+  kickOn = H.FootswitchIsPressed(FS1);
 
-  // FS2 — Bypass (edge)
-  {
-    bool fs2 = H.FootswitchIsPressed(FS2);
-    static bool prev = false;
-    if (fs2 && !prev) g_bypassed = !g_bypassed;
-    prev = fs2;
+  // FS2 — Bypass (edge-detected)
+  bool bypassSwitch = H.FootswitchIsPressed(FS2);
+  if (bypassSwitch && !prevBypassSwitch) {
+    bypassOn = !bypassOn;
   }
+  prevBypassSwitch = bypassSwitch;
 
-  // LEDs (active-HIGH)
-  H.SetLED(LED2, !g_bypassed);  // effect active
-  g_clip_env *= CLIP_LED_DECAY;
-  H.SetLED(LED1, g_clip_env > 0.12f || g_kick);  // clip meter / kick indicator
+  // LEDs (active‑HIGH on v1.3.0)
+  H.SetLED(LED2, !bypassOn);                       // effect active
+  clipEnvelope *= CLIP_LED_DECAY;                  // decay the clip glow
+  H.SetLED(LED1, clipEnvelope > 0.12f || kickOn);  // clip meter / kick indicator
 }
 
 // -----------------------------------------------------------------------------
-// User Guide
+// USER GUIDE
 // -----------------------------------------------------------------------------
 //
 // Overview
 // --------
-// **BasicBJT** captures the feel of transistor-based distortion by using an
-// exponential diode-like transfer (akin to a B-E junction). Compared to hard
-// clipping, it saturates more gradually, but with stronger odd-harmonic energy
-// and richer asymmetry options, especially when you bias the stage off-center.
+// **BasicBJT** uses an exponential, diode-like transfer (like a transistor’s base‑emitter)
+// to bend the waveform smoothly into distortion. Compared to hard clipping, the knee is
+// rounder, with rich odd harmonics and a wide range of asymmetry/bias textures.
 //
 // Controls
 // --------
-// - RV1 — Drive: overall pre-gain (0 → +36 dB).
-// - RV2 — Character (Vt): lower values = sharper knee / more fuzz; higher = smoother.
-// - RV3 — Asymmetry: skews the steepness of + vs – sides (mimics mismatched devices).
-// - RV4 — Bias: DC offset pre-shaper (±), shifting the operating point for texture.
-// - RV5 — Tone: post-EQ treble cut (700 Hz → 9 kHz).
+// - RV1 — Drive: pre‑gain (0 → +36 dB).
+// - RV2 — Character (Vt): lower = sharper knee / more fuzz; higher = smoother.
+// - RV3 — Asymmetry: skews the steepness of + vs – sides (mismatched devices).
+// - RV4 — Bias: DC offset pre-shaper (±), shifting the operating point.
+// - RV5 — Tone: post‑EQ treble cut (700 Hz → 9 kHz). (More on filters later.)
 // - RV6 — Master: overall output level (post).
-// - FS1 — Kick: hold for +6 dB extra into the shaper.
-// - FS2 — Bypass: true passthrough on/off.
-// - LED1 — Clip Meter: shows saturation activity (decay) and lights during Kick.
-// - LED2 — Effect Active: lit when engaged.
-//   (LEDs are **active-HIGH** with HaroldPCB v1.3.0+.)
+// - FS1 — Kick: hold for +6 dB into the shaper.
+// - FS2 — Bypass: true passthrough toggle.
+// - LED1 — Clip Meter: brief glow when clipping; also lights during Kick.
+// - LED2 — Effect Active.
 //
 // Signal Flow
 // -----------
-// Input → Drive → BJT/Diode Soft Clip (+Bias & Asym) → LPF Tone → Master → Out
+// Input → Drive → BJT/Diode Soft Clip (+Bias & Asym) → Low‑Pass Tone → Master → Out
 //
-// Customizable Parameters (top of file)
-// -------------------------------------
+// Tweak Points
+// ------------
 // - DRIVE_MIN_DB / DRIVE_MAX_DB: gain window.
-// - Vt_MIN / Vt_MAX: curve steepness range (lower = harsher).
+// - Vt_MIN / Vt_MAX: curve steepness range.
 // - SYM_RANGE_FRAC: asymmetry strength for Vt+ vs Vt-.
-// - BIAS_RANGE: DC offset authority pre-shaper.
-// - TONE_CUTOFF_MIN/MAX: post-EQ voicing.
+// - BIAS_RANGE: DC offset range pre‑shaper.
+// - TONE_CUTOFF_MIN/MAX: post‑EQ voicing.
 // - EXTRA_DRIVE_DB: Kick amount.
-// - SHAPER_GAIN: overall shaper scale if you retune curves.
-// - OUTPUT_TRIM / OUT_LIMIT: global gain and safety.
-//
-// Mods for Builders / Tinkerers
-// -----------------------------
-// 1) **Pre-Emphasis Tighten:** Add an input HPF (~120 Hz) before Drive to reduce mud.
-// 2) **Asym via Threshold:** Instead of skewing Vt, add small DC after Drive, before shaper.
-// 3) **Germanium Mode:** Lower Vt range (e.g., 0.10–0.30) for softer, squashier “Ge” flavor.
-// 4) **Presence Shelf:** After the LPF, add a tiny high-shelf to bring back air.
-// 5) **Two-Stage Stack:** Duplicate the shaper with different Vt/bias for complex fuzz.
-// 6) **Gate-y Mode:** Couple bias to envelope (decrease Vt and pull bias negative on low levels).
-//
-// Version & Credits
-// -----------------
-// v1.0.0 — by Harold Street Pedals 2025. Structured like a textbook page for the
-// HaroldPCB library (constants up top, prose user guide at the end). LEDs active-HIGH.
-//
+// - SHAPER_GAIN: overall shaper scale.
+// - OUTPUT_TRIM / OUT_LIMIT: final gain and safety.
