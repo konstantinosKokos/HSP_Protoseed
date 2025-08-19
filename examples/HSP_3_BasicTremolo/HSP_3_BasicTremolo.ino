@@ -1,253 +1,198 @@
-// HSP_BasicTremolo.ino — v1.0.0
+// HSP_BasicTremolo.ino — v1.0.2 (textbook, with “how” comments)
 // by Harold Street Pedals 2025
-// Classic amplitude tremolo with triangle/square shapes, momentary chop, and bypass
 //
-// This example follows the Harold Street Pedals textbook style:
-// - Constants for builders are at the top
-// - 48 kHz / 8-sample blocks
-// - Controls are read in loop() (never inside the audio callback)
-// - Audio callback is mono: in -> out
-// - Long, prose User Guide lives at the bottom of the file
+// Classic amplitude tremolo using a low‑frequency oscillator (LFO) to change
+// volume up/down over time.
+//
+// Signal path (mono): Input → LFO-controlled gain → Master (library) → Output
+//
+// Controls (HaroldPCB):
+//   RV1 = Rate (how fast it pulses)
+//   RV2 = Depth (how deep the volume swings)
+//   TS1 = Shape (OFF=triangle, ON=square)
+//   FS1 = Momentary Chop (while held, force full depth = hard on/off feel)
+//   FS2 = Bypass toggle (true passthrough)
+//   RV6 = Master (post effect; handled by library)
+//   LED1 = Chop indicator (lights while FS1 held)
+//   LED2 = Effect active (on when not bypassed)
 
 #include <HaroldPCB.h>
+#include <math.h>
 
 // -----------------------------------------------------------------------------
-// Constants (tunable parameters for builders / tinkerers / nerds)
+// Constants (tweak here)
 // -----------------------------------------------------------------------------
-static const uint32_t SAMPLE_RATE_HZ = 48000;  // Fixed: 48 kHz
-static const uint16_t BLOCK_SIZE = 8;          // Fixed: 8-sample audio block
+static const uint32_t SAMPLE_RATE_HZ = 48000;  // fixed
+static const uint16_t BLOCK_SIZE = 8;          // fixed
 
-// Rate range for RV1 (triangle/square tremolo LFO). Use musical bounds by default.
-static const float TREMOLO_RATE_MIN_HZ = 0.20f;  // slow throb
-static const float TREMOLO_RATE_MAX_HZ = 12.0f;  // fast shimmer
+// Tremolo rate range (musical defaults)
+static const float RATE_MIN_HZ = 0.20f;
+static const float RATE_MAX_HZ = 12.0f;
 
-// Depth taper and limits for RV2.
-// Depth maps 0..1 → modulation depth (0 = dry, 1 = full on/off chop)
-static const bool DEPTH_LOG_TAPER = true;  // set false for linear feel
-static const float DEPTH_MIN = 0.00f;      // floor
-static const float DEPTH_MAX = 1.00f;      // ceiling
+// Depth range (0 = no tremolo, 1 = full on/off)
+static const float DEPTH_MIN = 0.0f;
+static const float DEPTH_MAX = 1.0f;
 
-// Square smoothing (avoids hard-edged click). 0ms = raw square.
-// 5–20ms feels musical; increase for softer pulses.
+// Optional smoothing for square edges (ms). 0 = raw square (can click).
 static const float SQUARE_SMOOTH_MS = 12.0f;
 
-// Output trim (post trem) if you want to bias perceived loudness.
-// Usually 1.0f is fine; keep for experimentation or preset authoring.
-static const float OUTPUT_TRIM = 1.0f;
-
-// Safety clamp for the tremolo gain (just in case of future mods).
+// Safety clamp for gain in case you experiment
 static const float GAIN_MIN = 0.0f;
-static const float GAIN_MAX = 1.2f;  // a touch above unity for creative headroom
+static const float GAIN_MAX = 1.2f;
 
 // -----------------------------------------------------------------------------
 // Global state
 // -----------------------------------------------------------------------------
 static HaroldPCB H;
 
-// Cached control state (updated in loop(), consumed in AudioCB)
-static volatile float g_rate_hz = 2.0f;
-static volatile float g_depth = 0.7f;
-static volatile bool g_shape_sq = false;  // false=triangle, true=square
-static volatile bool g_bypassed = false;  // FS2 toggles this
+// Cached control state (set in loop(), read in AudioCB)
+static volatile float tremoloRateHz = 2.0f;   // RV1
+static volatile float depthAmount = 0.7f;     // RV2
+static volatile bool useSquareShape = false;  // TS1 (false=triangle, true=square)
+static volatile bool forceChopNow = false;    // FS1 (momentary full depth)
+static volatile bool isBypassed = false;      // FS2 (toggle in loop)
 
-// LFO phase and increments (used only in audio thread)
-static float g_lfo_phase = 0.0f;  // 0..1
-static float g_lfo_inc = 0.0f;    // per-sample phase step
+// LFO state (audio thread only)
+static float wavePhase = 0.0f;  // 0..1 position within one LFO cycle
+static float phaseStep = 0.0f;  // how much phase advances per sample
 
-// Square smoothing state (simple 1st-order low-pass in audio thread)
-static float g_sq_smooth = 0.0f;
+// Square smoothing state (for click-free squares)
+static float sqSmooth = 0.0f;
 
-// FS2 edge tracking done in loop()
-static bool prev_fs2 = false;
+// FS2 edge detect memory (loop() only)
+static bool prevFS2 = false;
 
 // -----------------------------------------------------------------------------
-// Helpers (mapping and small utilities) — lightweight and self-contained
+// Small helpers
 // -----------------------------------------------------------------------------
 
-// Map pot [0..1] to [min..max] with optional log/exp feel using library curves.
-static float MapPotRange(float raw01, float minv, float maxv, bool logfeel) {
-  if (!logfeel) return minv + (maxv - minv) * raw01;
-  // Use ReadPotMapped’s curve semantics by mimicking Exp10 feel:
-  // perceptually nicer for depth; rebuild locally to avoid extra reads here
-  float shaped = log10f(1.0f + 9.0f * raw01);  // Exp10 curve from library
-  return minv + (maxv - minv) * shaped;
+// Advance phase by phaseStep and wrap back into 0..1
+static inline float AdvancePhase(float phase, float step) {
+  phase += step;
+  if (phase >= 1.0f) phase -= 1.0f;
+  return phase;
 }
 
-// advance and wrap 0..1
-static inline float PhaseAdvance(float ph, float inc) {
-  ph += inc;
-  if (ph >= 1.0f) ph -= 1.0f;
-  return ph;
+// 1‑pole smoothing (used to soften square edges)
+// a = 1 - exp(-1/(tau * fs))  where tau = ms/1000
+static inline float OnePoleSmoothStep(float ms, float fs) {
+  if (ms <= 0.0f) return 1.0f;  // no smoothing
+  return 1.0f - expf(-1.0f / ((ms / 1000.0f) * fs));
 }
 
 // -----------------------------------------------------------------------------
-// Audio callback (runs at audio rate). No control reads here — use cached state.
+// Audio callback (runs at audio speed). Uses only cached state from loop().
 // -----------------------------------------------------------------------------
 void AudioCB(float in, float &out) {
-  // Bypass: pure passthrough, LED2 reflects active state from loop()
-  if (g_bypassed) {
+  // ----- BYPASS -----
+  // If bypassed, we do no processing: out = in (true passthrough).
+  if (isBypassed) {
     out = in;
     return;
   }
 
-  // Compute one-sample LFO value
-  // Triangle: 0..1..0; Square: 0 or 1 (smoothed).
-  // We use a bipolar-to-unipolar mapping later for gain.
-  float uni = 0.0f;  // unipolar 0..1
+  // ----- LFO VALUE (HOW we generate it) -----
+  // 1) wavePhase tracks where we are in the LFO cycle (0..1).
+  // 2) For triangle: fold a sawtooth to get a rise/fall 0..1..0 curve.
+  // 3) For square: produce 0 or 1, then optionally smooth with a 1‑pole filter
+  //    to avoid clicks (edge rounding).
+  float lfoUnipolar = 0.0f;  // LFO value in 0..1 (unipolar)
 
-  if (!g_shape_sq) {
-    // Triangle via folded saw: t in [0..1]
-    float t = g_lfo_phase;
-    float tri = (t < 0.5f) ? (t * 2.0f) : (2.0f - t * 2.0f);  // 0..1..0
-    uni = tri;
+  if (!useSquareShape) {
+    // Triangle via folded saw
+    float t = wavePhase;
+    lfoUnipolar = (t < 0.5f) ? (t * 2.0f) : (2.0f - t * 2.0f);  // 0..1..0
   } else {
-    // Raw square, then smooth with simple 1-pole LP to avoid clicks
-    float raw = (g_lfo_phase < 0.5f) ? 0.0f : 1.0f;
+    // Raw square, then optional smoothing
+    float raw = (wavePhase < 0.5f) ? 0.0f : 1.0f;
     if (SQUARE_SMOOTH_MS <= 0.0f) {
-      uni = raw;
+      lfoUnipolar = raw;
     } else {
-      // time-constant from ms → per-sample smoothing factor
-      // a = 1 - exp(-1 / (tau * fs)); tau = SQUARE_SMOOTH_MS/1000
-      float a = 1.0f - expf(-1.0f / ((SQUARE_SMOOTH_MS / 1000.0f) * SAMPLE_RATE_HZ));
-      g_sq_smooth += a * (raw - g_sq_smooth);
-      uni = g_sq_smooth;
+      float a = OnePoleSmoothStep(SQUARE_SMOOTH_MS, (float)SAMPLE_RATE_HZ);
+      sqSmooth += a * (raw - sqSmooth);  // y += a*(x - y)
+      lfoUnipolar = sqSmooth;
     }
   }
 
-  // Depth hack: FS1 held = momentary full-chop (performance feature)
-  const bool fs1_down = H.FootswitchIsPressed(FS1);
-  float depth = fs1_down ? 1.0f : g_depth;
+  // ----- DEPTH (HOW we apply tremolo) -----
+  // We make a gain between 0 and 1 using:
+  //
+  //   gain = (1 - depth) + depth * lfoUnipolar
+  //
+  // WHY this works:
+  //  • When lfoUnipolar = 0, gain = (1 - depth)  → the quietest point.
+  //  • When lfoUnipolar = 1, gain = 1           → full volume.
+  //  • depth = 0 gives gain = 1 always (no tremolo).
+  //
+  // Momentary Chop (FS1): while held, we override depth to 1.0 (full swing).
+  float depthNow = forceChopNow ? 1.0f : depthAmount;
+  float gain = (1.0f - depthNow) + depthNow * lfoUnipolar;
 
-  // Unipolar trem gain: mix between 1.0 (dry) and uni*(depth range)
-  // We want classic amplitude trem: gain = (1 - depth) + depth * uni
-  float gain = (1.0f - depth) + depth * uni;
-
-  // Safety + post trim
-  gain = constrain(gain * OUTPUT_TRIM, GAIN_MIN, GAIN_MAX);
-
+  // Safety clamp (if you experiment later) and apply to the signal:
+  gain = constrain(gain, GAIN_MIN, GAIN_MAX);
   out = in * gain;
 
-  // Advance LFO
-  g_lfo_phase = PhaseAdvance(g_lfo_phase, g_lfo_inc);
+  // ----- PHASE ADVANCE (HOW we move the LFO) -----
+  // Phase moves by phaseStep each sample. One full cycle is 1.0.
+  wavePhase = AdvancePhase(wavePhase, phaseStep);
 }
 
 // -----------------------------------------------------------------------------
-// Setup (runs once at power-on)
+// Setup (runs once)
 // -----------------------------------------------------------------------------
 void setup() {
   H.Init(SAMPLE_RATE_HZ, BLOCK_SIZE);
 
-  // Set initial master level from RV6 at boot
-  float master0 = H.ReadPot(RV6);
-  H.SetLevel(master0);
+  // Initial Master from RV6 (post effect, handled by library)
+  H.SetLevel(H.ReadPot(RV6));
 
-  // Precompute LFO increment from initial rate (will be updated in loop)
-  g_lfo_inc = (TREMOLO_RATE_MIN_HZ / (float)SAMPLE_RATE_HZ);
+  // Initial LFO step from default rate
+  phaseStep = tremoloRateHz / (float)SAMPLE_RATE_HZ;
 
   H.StartAudio(AudioCB);
 }
 
 // -----------------------------------------------------------------------------
-// Loop (runs continuously, not in audio time). Do all control work here.
+// Loop (control thread). Read knobs/switches here and update cached state.
 // -----------------------------------------------------------------------------
 void loop() {
-  H.Idle();  // services pots, toggles, footswitch debounce, etc.
+  // Keep library services running (debounce, etc.)
+  H.Idle();
 
-  // 1) RV1 → Rate (Hz) with musical bounds
-  {
-    float r = H.ReadPot(RV1);
-    float rate_hz = H.ReadPotMapped(RV1, TREMOLO_RATE_MIN_HZ, TREMOLO_RATE_MAX_HZ, HPCB_Curve::Exp10);
-    g_rate_hz = rate_hz;
-    g_lfo_inc = g_rate_hz / (float)SAMPLE_RATE_HZ;  // phase is 0..1 per cycle
-  }
+  // 1) RV1 → Rate (HOW we turn a knob into phase speed)
+  // We read RV1, map to [RATE_MIN_HZ..RATE_MAX_HZ] with an exponential feel,
+  // then compute phaseStep = rate / sampleRate so the LFO completes 1.0 per cycle.
+  tremoloRateHz = H.ReadPotMapped(RV1, RATE_MIN_HZ, RATE_MAX_HZ, HPCB_Curve::Exp10);
+  phaseStep = tremoloRateHz / (float)SAMPLE_RATE_HZ;
 
-  // 2) RV2 → Depth with optional log feel
-  {
-    float raw = H.ReadPot(RV2);
-    g_depth = MapPotRange(raw, DEPTH_MIN, DEPTH_MAX, DEPTH_LOG_TAPER);
-  }
+  // 2) RV2 → Depth (HOW we control swing size)
+  // depthAmount lives in [0..1]. 0 = no change; 1 = full on/off.
+  depthAmount = H.ReadPotMapped(RV2, DEPTH_MIN, DEPTH_MAX, HPCB_Curve::Linear);
 
-  // 3) TS1 → Shape (triangle / square)
-  g_shape_sq = H.ReadToggle(TS1);  // off=triangle, on=square
+  // 3) TS1 → Shape (HOW we choose triangle vs square)
+  // OFF = triangle (smooth), ON = square (with edge smoothing).
+  useSquareShape = H.ReadToggle(TS1);
 
-  // 4) RV6 → Master level (post, handled by library)
-  {
-    float m = H.ReadPotSmoothed(RV6, 15.0f);  // mild smoothing for fine control
-    if (!g_bypassed) {
-      H.SetLevel(m);  // Don't give the pot control in bypass,
-    } else {
-      H.SetLevel(1.0f);  // instead allow unity passthrough
-    }
-  }
+  // 4) FS1 → Momentary Chop (HOW we force full depth)
+  // While held, we set forceChopNow = true so AudioCB uses depth=1.0.
+  forceChopNow = H.FootswitchIsPressed(FS1);
+  H.SetLED(LED1, forceChopNow);  // LED1 shows chop is active
 
-  // 5) FS2 → Bypass toggle (edge detect here; library gives current state)
+  // 5) FS2 → Bypass (HOW we toggle clean passthrough)
+  // Rising-edge toggle: only flip when the switch goes from up→down.
   {
     bool fs2 = H.FootswitchIsPressed(FS2);
-    if (fs2 && !prev_fs2)  // rising edge
-    {
-      g_bypassed = !g_bypassed;
-    }
-    prev_fs2 = fs2;
+    if (fs2 && !prevFS2) isBypassed = !isBypassed;
+    prevFS2 = fs2;
   }
 
-  // 6) LEDs: LED2 = effect active, LED1 = momentary chop indicator
-  H.SetLED(LED2, !g_bypassed);
-  H.SetLED(LED1, H.FootswitchIsPressed(FS1));
-}
+  // 6) RV6 → Master (HOW we hand off final volume to the library)
+  // When the effect is ON, the knob sets master level. In bypass, force unity.
+  if (!isBypassed)
+    H.SetLevel(H.ReadPotSmoothed(RV6, 15.0f));  // mild smoothing feels nicer
+  else
+    H.SetLevel(1.0f);  // unity passthrough in bypass
 
-// -----------------------------------------------------------------------------
-// User Guide
-// -----------------------------------------------------------------------------
-//
-// Overview
-// --------
-// This is a classic amplitude tremolo voiced for musical ranges. It offers triangle
-// and square shapes, a momentary “chop” on FS1 (full-depth while held), and a true
-// passthrough bypass mode controlled by FS2. The master level (RV6) is post-effect
-// and handled by the HaroldPCB library.
-//
-// Controls
-// --------
-// - RV1 — Rate: sets tremolo speed from ~0.2 Hz (slow) up to ~12 Hz (fast).
-// - RV2 — Depth: 0 (no modulation) to 1 (full on/off chop). Uses a gentle log feel.
-// - RV6 — Master: overall output level (post effect), via library SetLevel().
-// - TS1 — Shape: off = triangle (smooth), on = square (smoothed to avoid clicks).
-// - FS1 — Momentary Chop: hold to force full-depth chop regardless of RV2.
-// - FS2 — Bypass Toggle: toggles clean passthrough on/off.
-// - LED1 — Chop Indicator: lights while FS1 is held.
-// - LED2 — Effect Active: on when effect is active, off when bypassed.
-//
-// How It Works
-// ------------
-// Pot and switch reads are done in loop() to keep the audio callback clean. The
-// audio callback uses cached values only. The LFO runs in the audio thread as a
-// phase accumulator (0..1); triangle is synthesized via a folded saw, square is
-// smoothed with a first-order low-pass (SQUARE_SMOOTH_MS) to avoid clicks.
-//
-// Customizable Parameters (see constants at the top)
-// --------------------------------------------------
-// - TREMOLO_RATE_MIN_HZ / TREMOLO_RATE_MAX_HZ: expand or narrow the speed window.
-// - DEPTH_LOG_TAPER: set to false for linear depth feel.
-// - SQUARE_SMOOTH_MS: increase to soften the square more (5–20ms is typical).
-// - OUTPUT_TRIM: adjust perceived loudness if you change depth behavior.
-// - GAIN_MIN / GAIN_MAX: safety clamp for experimental mods.
-//
-// Mods for Builders / Tinkerers
-// -----------------------------
-// 1) Bias the depth curve: try a quadratic remap for extra sensitivity near 0–0.3.
-// 2) Add stereo trem: duplicate this file and mod the library’s right channel path
-//    (HaroldPCB currently mutes right; you’d branch the library for true stereo).
-// 3) Pan-trem: convert the square/triangle to a bipolar LFO (-1..+1) and use it to
-//    crossfade two outputs for ping-pong effects (requires stereo support).
-// 4) Envelope tremolo: detect input level (simple rect + RC) in audio and modulate
-//    depth by dynamics for “auto-trem” vibes.
-// 5) Harmonic trem: split the signal with low/high shelving filters and invert the
-//    LFO polarity on one band for a vintage “harmonic tremolo” feel.
-// 6) Tap tempo: use FS1 double-press detection (from library timing) to estimate
-//    period and set g_rate_hz accordingly; blink LED1 at the tapped rate.
-//
-// Version & Credits
-// -----------------
-// v1.0.0 — by Harold Street Pedals 2025. Structured as a textbook example for the
-// HaroldPCB library with constants up top and a prose user guide at the end.
-//
+  // LED2 shows whether the effect is active
+  H.SetLED(LED2, !isBypassed);
+}
