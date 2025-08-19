@@ -145,15 +145,17 @@ Permission errors? On Windows, always use the MSYS2 MinGW 64-bit shell, not plai
 
 Still stuck? Unplug/replug USB and repeat step 4 carefully.
 
-
-
 ---
+
 
 💡 Tip: All examples are DFU-safe. They don’t open a Serial port, so even if you mess up the code, you can always get back into DFU mode and re-flash.
 
 > ⚠️ **Low‑latency default**: 48 kHz / 8‑sample blocks ≈ **0.17 ms** block latency (plus codec/IO). If you change `BLOCK_SIZE`, expect latency/CPU trade‑offs.
 
+> ⚠️ **THERE IS NO SERIAL MONITOR AVAILABLE!**  Nor is there any api for SD card.  they exist in the __disabled__ folder should you require them (you shouldn't) but, they caused me issues during vendoring and this was the quick and dirty solution.
+
 ---
+
 
 ## 4) Core programming model (mono)
 
@@ -179,7 +181,7 @@ void loop() {
   H.Idle();                 // services pots/toggles/footswitches
   H.SetLED(LED2, true);     // active‑HIGH
 }
-```
+
 
 ### 4.2 Common API calls
 - **Lifecycle**: `H.Init(sr, block)`, `H.StartAudio(callback)`, `H.Idle()`
