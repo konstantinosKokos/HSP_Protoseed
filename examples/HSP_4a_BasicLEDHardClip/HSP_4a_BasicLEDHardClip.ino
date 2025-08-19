@@ -2,6 +2,9 @@
 // by Harold Street Pedals 2025
 // Clean, transparent boost with a simple treble‑cut “tone” knob
 // and true passthrough bypass.
+//
+// Signal path: Input → Drive (dB→linear) → LED-like Hard Clip → Tone LPF → Master → Output
+//
 
 #include <HaroldPCB.h>
 
