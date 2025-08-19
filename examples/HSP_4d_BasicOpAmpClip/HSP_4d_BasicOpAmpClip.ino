@@ -1,37 +1,42 @@
-// BasicOpAmp.ino — v1.0.0
+// BasicOpAmp.ino — v1.0.1
 // by Harold Street Pedals 2025
-// High-gain op-amp style drive: soft feedback clipping with blendable hard diodes,
+// High‑gain op‑amp style drive: soft feedback clipping + blendable hard diodes,
 // post tone, momentary kick, and true bypass.
-// LEDs are active-HIGH (HaroldPCB v1.3.0+): SetLED(..., true) turns the LED on.
+// LEDs are active‑HIGH (HaroldPCB v1.3.0+): SetLED(..., true) turns the LED on.
+//
+// Signal Path
+// -----------
+// Input → Drive (pre‑gain) → [Soft Feedback || Hard Diodes] → Crossfade Mix → LPF Tone → Master (library) → Output
 
 #include <HaroldPCB.h>
+#include <math.h>
 
 // -----------------------------------------------------------------------------
-// Constants (tunable parameters for builders / tinkerers / nerds)
+// CONSTANTS (tweakable builder settings)
 // -----------------------------------------------------------------------------
 static const uint32_t SAMPLE_RATE_HZ = 48000;  // fixed project-wide
 static const uint16_t BLOCK_SIZE = 8;          // fixed project-wide
 
-// DRIVE (pre-gain into the virtual op-amp), in dB
+// DRIVE (pre‑gain into the virtual op‑amp), in dB
 static const float DRIVE_MIN_DB = 0.0f;   // unity
 static const float DRIVE_MAX_DB = 36.0f;  // ~63x linear
 
-// FS1 "kick" (extra pre-gain while held)
+// FS1 "kick" (extra pre‑gain while held)
 static const float EXTRA_DRIVE_DB = 6.0f;
 
-// Soft feedback clip "threshold" (shaping scale). Lower => more saturation.
+// Soft feedback clip “threshold” (shaping scale). Smaller = more saturation.
 static const float SOFT_THR_MIN = 0.18f;
 static const float SOFT_THR_MAX = 0.55f;
 
-// Hard diode clip threshold (emulates silicon/LED to ground). Lower => dirtier.
+// Hard diode clip threshold (emulates Si/LED to ground). Smaller = dirtier.
 static const float HARD_THR_MIN = 0.20f;
 static const float HARD_THR_MAX = 0.50f;
 
-// Mix between soft/hard stages (RV3): 0 = all soft (feedback style), 1 = all hard (to-ground).
+// Mix between soft/hard stages (RV3): 0 = all soft (feedback), 1 = all hard (to‑ground).
 static const float MIX_MIN = 0.0f;
 static const float MIX_MAX = 1.0f;
 
-// Post-tone: one-pole treble cut after clipping
+// Post‑tone: one‑pole treble cut after clipping
 static const float TONE_CUTOFF_MIN_HZ = 700.0f;
 static const float TONE_CUTOFF_MAX_HZ = 9500.0f;
 
@@ -44,54 +49,71 @@ static const float CLIP_LED_ATTACK = 1.00f;
 static const float CLIP_LED_DECAY = 0.90f;
 
 // -----------------------------------------------------------------------------
-// Global state
+// GLOBAL STATE
 // -----------------------------------------------------------------------------
 static HaroldPCB H;
 
 // Cached control state (updated in loop, used in audio)
-static volatile bool g_bypassed = false;
-static volatile bool g_kick = false;
-static volatile float g_drive_lin = 1.0f;
-static volatile float g_soft_thr = 0.35f;
-static volatile float g_hard_thr = 0.30f;
-static volatile float g_mix_hard = 0.25f;  // 0..1
-static volatile float g_lp_a = 0.0f;
-static volatile float g_lp_b = 1.0f;
+static volatile bool bypassOn = false;
+static volatile bool kickOn = false;
+static volatile float driveAmount = 1.0f;
+static volatile float softThreshold = 0.35f;
+static volatile float hardThreshold = 0.30f;
+static volatile float mixHardAmount = 0.25f;  // 0..1
 
-// Filter memory
-static float g_lp_z = 0.0f;
+// One‑pole low‑pass: y[n] = B*x[n] + A*y[n‑1], A = exp(-2πfc/fs), B = 1‑A
+static volatile float lowpassCoef_A = 0.0f;
+static volatile float lowpassCoef_B = 1.0f;
+static float lowpassMemory = 0.0f;
 
-// Clip meter envelope
-static float g_clip_env = 0.0f;
+// Clip meter envelope (for LED1)
+static float clipEnvelope = 0.0f;
 
-// FS2 edge tracking
-static bool prev_fs2 = false;
+// FS2 edge tracking for bypass toggle
+static bool prevBypassSwitch = false;
 
 // -----------------------------------------------------------------------------
-// Helpers
+// HELPERS
 // -----------------------------------------------------------------------------
 static inline float dB_to_lin(float db) {
-  return powf(10.0f, db * (1.0f / 20.0f));
+  return powf(10.0f, db / 20.0f);
 }
 
-// One-pole low-pass coeffs: y = b*x + a*y[n-1], a = exp(-2*pi*fc/fs), b = 1-a
-static void UpdateLowpassFromCutoff(float fc_hz) {
-  fc_hz = fmaxf(10.0f, fminf(fc_hz, SAMPLE_RATE_HZ * 0.45f));
-  float a = expf(-2.0f * (float)M_PI * fc_hz / (float)SAMPLE_RATE_HZ);
-  g_lp_a = a;
-  g_lp_b = 1.0f - a;
+// Compute one‑pole LPF coefficients for given cutoff
+static void UpdateLowpassFromCutoff(float cutoffHz) {
+  cutoffHz = fmaxf(10.0f, fminf(cutoffHz, SAMPLE_RATE_HZ * 0.45f));
+  float A = expf(-2.0f * (float)M_PI * cutoffHz / (float)SAMPLE_RATE_HZ);
+  lowpassCoef_A = A;
+  lowpassCoef_B = 1.0f - A;
 }
 
-// Soft feedback clip: tanh with adjustable "threshold" scale
-// Approximates an op-amp with diodes in the feedback path.
-static inline float SoftFeedback(float x, float thr, bool &nonlinear) {
-  float y = thr * tanhf(x / thr);
-  nonlinear |= (fabsf(x) > thr * 0.6f);
-  return y;
+// Soft feedback clip: tanh‑like feedback shaping
+// Math picture (plain English):
+// - Imagine an op‑amp whose gain is tamed by diodes in its feedback path.
+// - The more the signal grows, the more the “feedback diodes” push back,
+//   so instead of a sharp cutoff we get a smooth bend (an S‑curve).
+// Implementation here:
+//   y = thr * tanh(x / thr)
+// Where:
+//   - x  is the incoming sample (after Drive).
+//   - thr (softThreshold) is a scale factor that “spreads” the bend:
+//       smaller thr  → bend happens earlier (more saturation).
+//       larger  thr  → bend happens later  (cleaner).
+// Heuristic flag ‘nonlinear’ is set when x is big enough that the curve is
+// clearly bending (used to light the clip LED).
+static inline float SoftFeedbackShaper(float x, float thr, bool &nonlinear) {
+  float shaped = thr * tanhf(x / thr);
+  if (fabsf(x) > 0.6f * thr) nonlinear = true;  // “into the knee” → likely audible bend
+  return shaped;
 }
 
-// Hard diode clip to ground with symmetric thresholds
-static inline float HardDiode(float x, float thr, bool &nonlinear) {
+// Hard diode clip to ground (symmetric)
+// Math picture (plain English):
+// - This is the classic “ceiling” at ±threshold, like antiparallel diodes to ground.
+// - Below the ceiling: pass straight through.
+// - Above it: cut flat at +threshold / -threshold.
+// This adds strong edges (more bite) compared to the soft feedback bend.
+static inline float HardDiodeClipper(float x, float thr, bool &nonlinear) {
   if (x > thr) {
     nonlinear = true;
     return thr;
@@ -104,160 +126,135 @@ static inline float HardDiode(float x, float thr, bool &nonlinear) {
 }
 
 // -----------------------------------------------------------------------------
-// Audio callback (audio thread). No control reads here.
+// AUDIO CALLBACK (runs at audio rate; use cached values only)
 // -----------------------------------------------------------------------------
 void AudioCB(float in, float &out) {
-  if (g_bypassed) {
+  if (bypassOn) {
     out = in;
     return;
   }
 
-  // 1) Pre-gain with momentary kick
-  float pre = in * g_drive_lin * (g_kick ? dB_to_lin(EXTRA_DRIVE_DB) : 1.0f);
+  // 1) Pre‑gain with momentary kick (FS1)
+  //    We multiply the input sample by:
+  //      driveAmount (from RV1, dB→linear) and, if kickOn, an extra +6 dB.
+  float preGain = driveAmount * (kickOn ? dB_to_lin(EXTRA_DRIVE_DB) : 1.0f);
+  float driven = in * preGain;
 
-  // 2) Run both shapers, then crossfade by g_mix_hard
-  bool nl_soft = false, nl_hard = false;
-  float y_soft = SoftFeedback(pre, g_soft_thr, nl_soft);
-  float y_hard = HardDiode(pre, g_hard_thr, nl_hard);
+  // 2) Run both shapers independently, then crossfade them
+  //    SoftFeedbackShaper() → smooth bend (feedback feel)
+  //    HardDiodeClipper()   → flat ceiling (to‑ground bite)
+  bool bentSoft = false, bentHard = false;
+  float y_soft = SoftFeedbackShaper(driven, softThreshold, bentSoft);
+  float y_hard = HardDiodeClipper(driven, hardThreshold, bentHard);
 
-  float mix = g_mix_hard;  // 0..1
-  float y = (1.0f - mix) * y_soft + mix * y_hard;
+  // Crossfade:
+  //   mixHardAmount = 0   → all soft
+  //   mixHardAmount = 1   → all hard
+  float mixed = (1.0f - mixHardAmount) * y_soft + mixHardAmount * y_hard;
 
-  // 3) Post tone (LPF)
-  g_lp_z = g_lp_b * y + g_lp_a * g_lp_z;
-  y = g_lp_z;
+  // 3) Post TONE (brief: one‑pole LPF; we’ll cover filters deeper later)
+  lowpassMemory = lowpassCoef_B * mixed + lowpassCoef_A * lowpassMemory;
+  float toned = lowpassMemory;
 
-  // 4) Output trim + safety
-  y *= OUTPUT_TRIM;
-  y = fmaxf(-OUT_LIMIT, fminf(y, OUT_LIMIT));
+  // 4) Output trim + safety limit
+  toned *= OUTPUT_TRIM;
+  toned = fmaxf(-OUT_LIMIT, fminf(toned, OUT_LIMIT));
 
-  // Clip meter
-  if (nl_soft || nl_hard) g_clip_env = fminf(1.0f, CLIP_LED_ATTACK * (g_clip_env + 0.30f));
+  // Clip meter envelope “kick” when either stage is clearly nonlinear
+  if (bentSoft || bentHard)
+    clipEnvelope = fminf(1.0f, CLIP_LED_ATTACK * (clipEnvelope + 0.30f));
 
-  out = y;
+  out = toned;
 }
 
 // -----------------------------------------------------------------------------
-// Setup (once)
+// SETUP (runs once)
 // -----------------------------------------------------------------------------
 void setup() {
   H.Init(SAMPLE_RATE_HZ, BLOCK_SIZE);
 
   // Pots at boot
-  g_drive_lin = dB_to_lin(H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10));
-  g_soft_thr = H.ReadPotMapped(RV2, SOFT_THR_MIN, SOFT_THR_MAX, HPCB_Curve::Exp10);  // "character"
-  g_hard_thr = H.ReadPotMapped(RV4, HARD_THR_MIN, HARD_THR_MAX, HPCB_Curve::Exp10);  // "diode level"
-  g_mix_hard = H.ReadPot(RV3);                                                       // 0..1 mix
+  driveAmount = dB_to_lin(H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10));
+  softThreshold = H.ReadPotMapped(RV2, SOFT_THR_MIN, SOFT_THR_MAX, HPCB_Curve::Exp10);  // “character”
+  hardThreshold = H.ReadPotMapped(RV4, HARD_THR_MIN, HARD_THR_MAX, HPCB_Curve::Exp10);  // “diode level”
+  mixHardAmount = H.ReadPot(RV3);                                                       // 0..1 mix
 
-  float fc0 = H.ReadPotMapped(RV5, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
-  UpdateLowpassFromCutoff(fc0);
+  float cutoff0 = H.ReadPotMapped(RV5, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
+  UpdateLowpassFromCutoff(cutoff0);
 
   // Master (post)
-  if (!g_bypassed) {
-    H.SetLevel(H.ReadPotSmoothed(RV6, 15.0f));  // Don't read pot if bypassed,
-  } else {
-    H.SetLevel(1.0f);  // instead set unity gain.
-  }
+  H.SetLevel(H.ReadPot(RV6));
 
   H.StartAudio(AudioCB);
 }
 
 // -----------------------------------------------------------------------------
-// Loop (control/UI; not in audio time)
+// LOOP (controls/UI; not in audio time)
 // -----------------------------------------------------------------------------
 void loop() {
+  // If you prefer, remove this later once you centralize control servicing elsewhere.
   H.Idle();
 
   // RV1 — Drive (dB → linear)
-  g_drive_lin = dB_to_lin(H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10));
+  driveAmount = dB_to_lin(H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10));
 
   // RV2 — Soft feedback character (threshold)
-  g_soft_thr = H.ReadPotMapped(RV2, SOFT_THR_MIN, SOFT_THR_MAX, HPCB_Curve::Exp10);
+  softThreshold = H.ReadPotMapped(RV2, SOFT_THR_MIN, SOFT_THR_MAX, HPCB_Curve::Exp10);
 
   // RV3 — Soft↔Hard blend (0..1)
-  g_mix_hard = H.ReadPot(RV3);
+  mixHardAmount = H.ReadPot(RV3);
 
   // RV4 — Hard diode threshold
-  g_hard_thr = H.ReadPotMapped(RV4, HARD_THR_MIN, HARD_THR_MAX, HPCB_Curve::Exp10);
+  hardThreshold = H.ReadPotMapped(RV4, HARD_THR_MIN, HARD_THR_MAX, HPCB_Curve::Exp10);
 
-  // RV5 — Post Tone cutoff
+  // RV5 — Post Tone cutoff (LPF)
   {
-    float fc = H.ReadPotMapped(RV5, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
-    UpdateLowpassFromCutoff(fc);
+    float cutoff = H.ReadPotMapped(RV5, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
+    UpdateLowpassFromCutoff(cutoff);
   }
 
-  // RV6 — Master (post), lightly smoothed
-  if (!g_bypassed) {
-    H.SetLevel(H.ReadPotSmoothed(RV6, 15.0f));  // Don't read pot if bypassed,
-  } else {
-    H.SetLevel(1.0f);  // instead set unity gain.
-  }
+  // RV6 — Master (post). Smooth when engaged; unity when bypassed.
+  H.SetLevel(bypassOn ? 1.0f : H.ReadPotSmoothed(RV6, 15.0f));
 
   // FS1 — Kick (momentary)
-  g_kick = H.FootswitchIsPressed(FS1);
+  kickOn = H.FootswitchIsPressed(FS1);
 
-  // FS2 — Bypass (edge detect)
-  {
-    bool fs2 = H.FootswitchIsPressed(FS2);
-    if (fs2 && !prev_fs2) g_bypassed = !g_bypassed;
-    prev_fs2 = fs2;
-  }
+  // FS2 — Bypass toggle (edge detect)
+  bool bypassSwitch = H.FootswitchIsPressed(FS2);
+  if (bypassSwitch && !prevBypassSwitch)
+    bypassOn = !bypassOn;
+  prevBypassSwitch = bypassSwitch;
 
-  // LEDs (active-HIGH)
-  H.SetLED(LED2, !g_bypassed);  // Effect active
-  g_clip_env *= CLIP_LED_DECAY;
-  H.SetLED(LED1, g_clip_env > 0.12f || g_kick);  // Clip/kick indicator
+  // LEDs (active‑HIGH)
+  H.SetLED(LED2, !bypassOn);                       // effect active
+  clipEnvelope *= CLIP_LED_DECAY;                  // decay the clip glow
+  H.SetLED(LED1, clipEnvelope > 0.12f || kickOn);  // clip meter / kick indicator
 }
 
 // -----------------------------------------------------------------------------
-// User Guide
+// USER GUIDE
 // -----------------------------------------------------------------------------
 //
 // Overview
 // --------
-// **BasicOpAmp** captures the feel of a high-gain op-amp dirt block. A soft
-// feedback clipper (tanh-like, LED-ish) provides smooth saturation, while a
-// hard diode-to-ground clipper adds bite. RV3 blends between the two worlds,
-// so you can sweep from TS-like softness to RAT/Dist+-style edge.
+// **BasicOpAmp** blends two classic clipping flavors:
+// 1) **Soft feedback bend** (tanh‑like): smooth, LED/feedback vibe.
+// 2) **Hard to ground** (flat ceiling): bite and edge.
+// RV3 crossfades between them so you can sweep from TS‑like softness to RAT/Dist+‑style bite.
 //
 // Controls
 // --------
-// - RV1 — Drive: pre-gain into the stage (0 → +36 dB).
-// - RV2 — Soft Character: soft feedback threshold (lower = more saturation).
+// - RV1 — Drive: pre‑gain (0 → +36 dB).
+// - RV2 — Soft Character: soft feedback threshold (smaller = more saturation).
 // - RV3 — Soft↔Hard Mix: 0 = all soft feedback, 1 = all hard diodes.
-// - RV4 — Hard Threshold: diode clip ceiling (lower = dirtier).
+// - RV4 — Hard Threshold: diode clip ceiling (smaller = dirtier).
 // - RV5 — Tone: post treble cut (700 Hz → 9.5 kHz).
 // - RV6 — Master: overall output level (post), via library SetLevel().
-// - FS1 — Kick: hold for +6 dB extra pre-gain.
+// - FS1 — Kick: hold for +6 dB extra pre‑gain.
 // - FS2 — Bypass: true passthrough on/off.
 // - LED1 — Clip Meter: shows saturation (decay) and lights during Kick.
 // - LED2 — Effect Active: lit when engaged.
-//   (LEDs are **active-HIGH** with HaroldPCB v1.3.0+.)
 //
-// Signal Flow
-// -----------
-// Input → Drive → [Soft Feedback || Hard Diodes] → Mix → LPF Tone → Master → Out
-//
-// Customizable Parameters (top of file)
-// -------------------------------------
-// - DRIVE_MIN_DB / DRIVE_MAX_DB: overall gain window.
-// - SOFT_THR_MIN/MAX: feedback clip “softness” range.
-// - HARD_THR_MIN/MAX: diode ceiling range; retune for “LED color” vibes.
-// - MIX_MIN/MAX: change the sweep behavior or quantize into modes.
-// - TONE_CUTOFF_MIN/MAX: post-EQ voicing.
-// - EXTRA_DRIVE_DB: Kick amount.
-// - OUTPUT_TRIM / OUT_LIMIT: global level and safety.
-//
-// Mods for Builders / Tinkerers
-// -----------------------------
-// 1) **Pre-EQ Tight**: High-pass at 120 Hz before Drive for tighter lows.
-// 2) **Presence**: Add a tiny post high-shelf to reopen air above the LPF.
-// 3) **Symmetry**: Add a bias pot to asymmetrically offset soft clip before tanh.
-// 4) **Modes on TS1/TS2**: Toggle diode types: Si vs LED (just change thresholds).
-// 5) **Anti-alias**: If you push extreme drive, experiment with lightweight 2× OS.
-//
-// Version & Credits
-// -----------------
-// v1.0.0 — by Harold Street Pedals 2025. Structured as a textbook example for the
-// HaroldPCB library (constants up top, prose user guide at the end). LEDs active-HIGH.
-//
+// Signal Flow (for quick reference)
+// ---------------------------------
+// Input → Drive → [Soft Feedback || Hard Diodes] → Crossfade Mix → LPF Tone → Master → Output
