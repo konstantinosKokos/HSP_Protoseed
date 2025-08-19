@@ -3,7 +3,10 @@
 //
 // This is the “Hello World” pedal.
 // Sound in → sound out, no changes.
-// Use this to learn the shape of an Arduino pedal sketch.
+// Use this to learn the shape of an Arduino pedal sketch,
+// or modify it to use as a hardware test sketch.
+
+// Signal Path: In → Out (LED for functional test only)
 
 #include <HaroldPCB.h>  // Library that knows how to talk to the pedal hardware
 
