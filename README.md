@@ -41,7 +41,7 @@ HaroldPCB/
 
 ---
 
-## 3) Quick start
+## 3A) Quick start
 1. **Install toolchain**
    - Arduino IDE 2.x or PlatformIO
    - Board support per your HaroldPCB target (same setup you already use to flash other HSP sketches)
@@ -52,6 +52,107 @@ HaroldPCB/
 4. **Build & flash**
    - Confirm audio passes through; LED logic should be **active‑HIGH**
 5. **Tweak constants** at the top of the sketch and reflash
+
+
+
+## 3B) Installation (DFU on Windows, step-by-step)
+
+These boards ship blank. You’ll need to install the toolchain and flash firmware once to get started.  
+This guide assumes you know *nothing* and have *none* of the tools yet.
+
+---
+
+### 1. Install MSYS2 (gives you a Unix-like shell on Windows)
+- Go to [https://www.msys2.org](https://www.msys2.org).
+- Download the installer and run it (default options are fine).
+- Open the new **MSYS2 MinGW 64-bit** shortcut from your Start menu.
+
+---
+
+### 2. Install required packages inside MSYS2
+In the MSYS2 window, paste these commands one by one:
+
+```bash
+pacman -Syu       # full system update (will close the window, reopen after)
+pacman -S git make gcc unzip dfu-util
+
+git lets you download code from GitHub.
+
+make and gcc compile the firmware.
+
+dfu-util is the program that talks to the Daisy Seed in bootloader mode.
+
+
+
+---
+
+3. Get the HaroldPCB library and examples
+
+Still inside MSYS2:
+
+cd ~
+git clone https://github.com/Harold-Street-Pedal-Company/HSP_Protoseed.git
+cd HSP_Protoseed
+
+
+---
+
+4. Put the Daisy Seed into DFU (bootloader) mode
+
+Unplug USB.
+
+Hold down the BOOT button on the Seed.
+
+While holding BOOT, plug in USB.
+
+Quickly tap the RESET button once, then release BOOT.
+
+The Seed is now waiting for firmware (LED will be dim).
+
+
+Windows will show a new device called STM32 BOOTLOADER if it worked.
+
+
+---
+
+5. Build and flash an example
+
+Inside MSYS2, from the library folder:
+
+make program-dfu
+
+This compiles the default sketch and immediately flashes it with dfu-util.
+
+When it finishes, the Seed reboots and starts running your pedal firmware.
+
+
+
+---
+
+6. Re-flash different examples
+
+Change into any example folder (e.g., examples/HSP_Tremolo) and run:
+
+make program-dfu
+
+That’s it. You can keep re-flashing as you experiment.
+
+
+---
+
+Troubleshooting
+
+Device not found? Check you’re really in DFU mode (BOOT held, tap RESET, release BOOT).
+
+Permission errors? On Windows, always use the MSYS2 MinGW 64-bit shell, not plain PowerShell.
+
+Still stuck? Unplug/replug USB and repeat step 4 carefully.
+
+
+
+---
+
+💡 Tip: All examples are DFU-safe. They don’t open a Serial port, so even if you mess up the code, you can always get back into DFU mode and re-flash.
 
 > ⚠️ **Low‑latency default**: 48 kHz / 8‑sample blocks ≈ **0.17 ms** block latency (plus codec/IO). If you change `BLOCK_SIZE`, expect latency/CPU trade‑offs.
 
