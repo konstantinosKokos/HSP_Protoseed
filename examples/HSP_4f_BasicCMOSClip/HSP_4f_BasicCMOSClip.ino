@@ -2,9 +2,15 @@
 // by Harold Street Pedals 2025
 // CMOS inverter–style fuzz (CD4049/4069 vibe) using odd-symmetric polynomial shaping,
 // optional supply "sag," post tone, momentary kick, and true bypass.
-// LEDs are active-HIGH (HaroldPCB v1.3.0+): SetLED(..., true) turns the LED on.
+//
+// Signal Flow
+// -----------
+// Input → Drive → CMOS Polynomial (x − a·x^3 + b·x^5) → HSP_SoftLimit → LPF Tone → Master → Out
+//             ↘—— optional SAG (envelope-controlled pre-attenuation) ——↗
+//
 
 #include <HaroldPCB.h>
+#include <math.h>
 
 // -----------------------------------------------------------------------------
 // Constants (tunable parameters for builders / tinkerers / nerds)
@@ -101,8 +107,8 @@ static void UpdateSagTimes() {
   g_env_a_rel = 1.0f - expf(-1.0f / ((SAG_RELEASE_MS / 1000.0f) * SAMPLE_RATE_HZ));
 }
 
-// Soft limiter around ±SOFT_LIM_THR using tanh skirt
-static inline float SoftLimit(float x) {
+// Renamed to avoid collision with daisysp::SoftLimit(float)
+static inline float HSP_SoftLimit(float x) {
   const float t = SOFT_LIM_THR;
   if (fabsf(x) <= t) return x;
   float sign = (x >= 0.0f) ? 1.0f : -1.0f;
@@ -118,7 +124,7 @@ static inline float CMOS_Poly(float x, float pre, float a3, float b5, bool &clip
   float v5 = v3 * v2;
 
   float y = v - a3 * v3 + b5 * v5;  // odd polynomial
-  float yl = SoftLimit(y);
+  float yl = HSP_SoftLimit(y);
 
   // heuristic for clip LED: cubic term magnitude vs base
   if (fabsf(a3 * v3) > 0.08f || fabsf(b5 * v5) > 0.04f) clipped = true;
@@ -270,11 +276,6 @@ void loop() {
 // - LED2 — Effect Active: lit when engaged.
 //   (LEDs are **active-HIGH** with HaroldPCB v1.3.0+.)
 //
-// Signal Flow
-// -----------
-// Input → Drive → CMOS Polynomial (x − a·x^3 + b·x^5) → Soft Limit → LPF Tone → Master → Out
-//             ↘—— optional SAG (envelope-controlled pre-attenuation) ——↗
-//
 // Customizable Parameters (top of file)
 // -------------------------------------
 // - A_MIN/A_MAX: cubic range (main flavor). Higher = more crunch.
@@ -287,7 +288,7 @@ void loop() {
 //
 // Mods for Builders / Tinkerers
 // -----------------------------
-// 1) **LED Rail Emu:** Replace SoftLimit with an LED-ish soft clip (tanh scaled) to
+// 1) **LED Rail Emu:** Replace HSP_SoftLimit with an LED-ish soft clip (tanh scaled) to
 //    mimic rails that “glow” instead of brick-wall.
 // 2) **Gatey Mode:** Couple sag to a tiny negative DC bias pre-shaper so low-level
 //    sustain crackles (lo-fi synthy gate).
@@ -302,4 +303,3 @@ void loop() {
 // -----------------
 // v1.0.0 — by Harold Street Pedals 2025. Structured like a textbook page for the
 // HaroldPCB library (constants up top, prose user guide at the end). LEDs active-HIGH.
-//
