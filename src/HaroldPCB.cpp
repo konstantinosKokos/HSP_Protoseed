@@ -1,124 +1,193 @@
 #include "HaroldPCB.h"
 
-// If you’re using DaisyDuino, include its header and use its globals here.
-// We keep it header-light so your code compiles even without DaisyDuino present.
-// If DAISY isn’t present, we just do “software passthrough” in _MonoThunk.
-
-// Static storage for the user’s mono callback
-HPCB_AudioCB_Mono HaroldPCB::user_mono_cb_ = nullptr;
-
 // -----------------------------------------------------------------------------
-// Init — set sample rate, block size, and configure pins
+// HaroldPCB.cpp  — v1.3.0 runtime (DaisyDuino begin API, PascalCase setters)
 // -----------------------------------------------------------------------------
-bool HaroldPCB::Init(uint32_t sample_rate_hz, uint16_t block_size) {
-  sample_rate_hz_ = sample_rate_hz ? sample_rate_hz : 48000;
-  block_size_     = block_size     ? block_size     : 48;
 
-  // Configure control I/O
-  for (uint8_t i = 0; i < kNumPots;    ++i) { pinMode(pot_pins_[i],    INPUT); }
-  for (uint8_t i = 0; i < kNumToggles; ++i) { pinMode(toggle_pins_[i], INPUT_PULLUP); }
-  for (uint8_t i = 0; i < kNumFS;      ++i) { pinMode(fs_pins_[i],     INPUT_PULLUP); }
-  for (uint8_t i = 0; i < kNumLEDs;    ++i) { pinMode(led_pins_[i],    OUTPUT);
-                                              digitalWrite(led_pins_[i], LOW); } // LED off (active-HIGH)
+static HaroldPCB* _g_instance = nullptr;
 
-  // If you have real Daisy audio setup, initialize it here.
-  // (Left as a no-op so the library compiles on vanilla cores.)
-  return true;
-}
+void _BlockCB(float **in, float **out, size_t sz)
+{
+    HaroldPCB* h = _g_instance;
+    if(!h || !h->cb_) return;
 
-// -----------------------------------------------------------------------------
-// Start/Stop audio — store the user callback; hook it to your audio driver
-// -----------------------------------------------------------------------------
-bool HaroldPCB::StartAudio(HPCB_AudioCB_Mono cb_mono) {
-  user_mono_cb_ = cb_mono;
-  // If you have a hardware driver, start it with _MonoThunk here.
-  // DAISY.begin(_MonoThunk);
-  return user_mono_cb_ != nullptr;
-}
-
-void HaroldPCB::StopAudio() {
-  // DAISY.end();
-  user_mono_cb_ = nullptr;
-}
-
-const char* HaroldPCB::Version() { return HPCB_VERSION_STR; }
-
-// -----------------------------------------------------------------------------
-// Audio bridge: pass Left through user callback; keep Right silent for mono
-// -----------------------------------------------------------------------------
-void HaroldPCB::_MonoThunk(float **in, float **out, size_t size) {
-  HPCB_AudioCB_Mono cb = user_mono_cb_;
-  if (!cb) {
-    // No user callback: just copy L→L and mute R
-    for (size_t i = 0; i < size; ++i) {
-      out[0][i] = in[0][i];
-      out[1][i] = 0.0f;
+    for(size_t i = 0; i < sz; i++)
+    {
+        float o = 0.0f;
+        float x = in[0][i];
+        h->cb_(x, o);
+        out[0][i] = o * h->master_level_;
+        out[1][i] = 0.0f; // mono: right muted
     }
-    return;
-  }
-  for (size_t i = 0; i < size; ++i) {
-    float o = 0.0f;
-    cb(in[0][i], o);
-    out[0][i] = o;
-    out[1][i] = 0.0f;
-  }
 }
 
-// -----------------------------------------------------------------------------
-// Controls
-// -----------------------------------------------------------------------------
-float HaroldPCB::ReadPot(uint8_t index) {
-  if (index >= kNumPots) return 0.0f;
-  // Default Arduino analogRead is 10-bit on many cores (0..1023).
-  // If your core is different, adjust the divisor.
-  return analogRead(pot_pins_[index]) / 1023.0f;
+float HaroldPCB::_applyCurve(float v, HPCB_Curve c)
+{
+    if(v < 0.0f) v = 0.0f;
+    if(v > 1.0f) v = 1.0f;
+
+    switch(c)
+    {
+        case HPCB_Curve::Log10: return (powf(10.0f, v) - 1.0f) / 9.0f;
+        case HPCB_Curve::Exp10: return log10f(1.0f + 9.0f * v);
+        default:                 return v;
+    }
 }
 
-float HaroldPCB::ReadPotMapped(uint8_t index, float minv, float maxv, HPCB_Curve curve) {
-  float v = ReadPot(index); // 0..1
-  switch (curve) {
-    case HPCB_Curve::Log10: v = log10f(1.0f + 9.0f * v); break;            // more resolution near 0
-    case HPCB_Curve::Exp10: v = (powf(10.0f, v) - 1.0f) / 9.0f; break;     // more near 1
-    default: break; // Linear
-  }
-  return minv + (maxv - minv) * v;
+void HaroldPCB::_serviceMaster()
+{
+    if(master_bound_)
+    {
+        float raw = ReadPot(master_src_);
+        master_level_ = _applyCurve(raw, master_curve_);
+    }
 }
 
-float HaroldPCB::ReadPotSmoothed(uint8_t index, float smooth_ms) {
-  if (index >= kNumPots) return 0.0f;
+void HaroldPCB::_serviceFootswitches()
+{
+    const uint32_t now = millis();
 
-  float raw      = ReadPot(index);
-  float dt_ms    = (1000.0f * block_size_) / float(sample_rate_hz_);
-  float alpha    = (smooth_ms <= 0.0f) ? 1.0f : dt_ms / (smooth_ms + dt_ms);
-  pot_smooth_[index] += alpha * (raw - pot_smooth_[index]);
-  return pot_smooth_[index];
+    for(int i = 0; i < HPCB_NUM_FOOTSWITCHES; i++)
+    {
+        const bool raw_level = !digitalRead(footswitch_pins_[i]);
+
+        if(raw_level != fs_pressed_[i] && (now - fs_last_change_[i]) >= fs_timing_.debounce_ms)
+        {
+            fs_pressed_[i]     = raw_level;
+            fs_last_change_[i] = now;
+
+            if(raw_level)
+            {
+                const uint32_t gap = now - fs_last_press_time_[i];
+                fs_last_press_time_[i] = now;
+                fs_click_count_[i]++;
+
+                if(gap <= fs_timing_.multiclick_gap_ms && fs_click_count_[i] == 2)
+                    fs_evt_double_[i] = true;
+            }
+            else
+            {
+                const uint32_t held = now - fs_last_press_time_[i];
+                if(held >= fs_timing_.longpress_ms)
+                {
+                    if(fs_click_count_[i] == 1)      fs_evt_long_[i]       = true;
+                    else if(fs_click_count_[i] == 2) fs_evt_doublelong_[i] = true;
+                }
+                fs_click_count_[i] = 0;
+            }
+        }
+    }
 }
 
-bool HaroldPCB::ReadToggle(uint8_t index) const {
-  if (index >= kNumToggles) return false;
-  return digitalRead(toggle_pins_[index]) == LOW; // active-low wiring typical
+bool HaroldPCB::Init(uint32_t sample_rate_hz, uint16_t block_size)
+{
+    sr_    = sample_rate_hz ? sample_rate_hz : 48000;
+    block_ = block_size ? block_size : 8;
+    _g_instance = this;
+
+    for(int i = 0; i < HPCB_NUM_POTS; i++)         pinMode(pot_pins_[i], INPUT);
+    for(int i = 0; i < HPCB_NUM_TOGGLES; i++)      pinMode(toggle_pins_[i], INPUT_PULLUP);
+    for(int i = 0; i < HPCB_NUM_FOOTSWITCHES; i++) pinMode(footswitch_pins_[i], INPUT_PULLUP);
+    for(int i = 0; i < HPCB_NUM_LEDS; i++)         pinMode(led_pins_[i], OUTPUT);
+
+    // Daisy hardware/audio
+    DAISY.init(DAISY_SEED);
+    DAISY.SetAudioBlockSize(block_);
+    DAISY.SetAudioSampleRate((daisy::SaiHandle::Config::SampleRate)sr_);
+
+    return true;
 }
 
-bool HaroldPCB::FootswitchIsPressed(uint8_t index) const {
-  if (index >= kNumFS) return false;
-  return digitalRead(fs_pins_[index]) == LOW;     // pressed = LOW (pull-up)
+bool HaroldPCB::StartAudio(HPCB_AudioCB_Mono cb_mono)
+{
+    cb_ = cb_mono;
+    if(!cb_) return false;
+    DAISY.begin(_BlockCB);
+    return true;
 }
 
-bool HaroldPCB::FootswitchIsReleased(uint8_t index) const {
-  if (index >= kNumFS) return true;
-  return digitalRead(fs_pins_[index]) == HIGH;
+void HaroldPCB::StopAudio() { DAISY.end(); }
+
+void HaroldPCB::Idle()
+{
+    _serviceMaster();
+    _serviceFootswitches();
 }
 
-// -----------------------------------------------------------------------------
-// Outputs / Idle
-// -----------------------------------------------------------------------------
-void HaroldPCB::SetLED(uint8_t index, bool on) {
-  if (index >= kNumLEDs) return;
-  digitalWrite(led_pins_[index], on ? HIGH : LOW);
+float HaroldPCB::ReadPot(uint8_t index)
+{
+    if(index >= HPCB_NUM_POTS) return 0.0f;
+    return analogRead(pot_pins_[index]) / 1023.0f; // 10-bit Daisy ADC
 }
 
-void HaroldPCB::Idle() {
-  // Hook for future debouncing/timing/housekeeping FSM.
-  // Keeping this here lets your sketches stay the same as the library grows.
+float HaroldPCB::ReadPotMapped(uint8_t index, float min, float max, HPCB_Curve curve)
+{
+    float v = ReadPot(index);
+    return min + (max - min) * _applyCurve(v, curve);
+}
+
+float HaroldPCB::ReadPotSmoothed(uint8_t index, float smooth_ms)
+{
+    float v = ReadPot(index);
+    if(index >= HPCB_NUM_POTS) return v;
+
+    if(smooth_ms <= 0.0f) { pot_state_[index] = v; return v; }
+
+    const float blocks_per_second = (float)sr_ / (float)block_;
+    const float a = 1.0f - expf(-1.0f / (smooth_ms * (blocks_per_second / 1000.0f)));
+    pot_state_[index] += a * (v - pot_state_[index]);
+    return pot_state_[index];
+}
+
+bool HaroldPCB::ReadToggle(uint8_t index) const
+{
+    if(index >= HPCB_NUM_TOGGLES) return false;
+    return !digitalRead(toggle_pins_[index]);
+}
+
+bool HaroldPCB::FootswitchIsPressed(uint8_t index) const
+{
+    if(index >= HPCB_NUM_FOOTSWITCHES) return false;
+    return fs_pressed_[index];
+}
+
+bool HaroldPCB::FootswitchIsReleased(uint8_t index) const
+{
+    return !FootswitchIsPressed(index);
+}
+
+bool HaroldPCB::FootswitchIsLongPressed(uint8_t index)
+{
+    if(index >= HPCB_NUM_FOOTSWITCHES) return false;
+    bool f = fs_evt_long_[index];
+    fs_evt_long_[index] = false;
+    return f;
+}
+
+bool HaroldPCB::FootswitchIsDoublePressed(uint8_t index)
+{
+    if(index >= HPCB_NUM_FOOTSWITCHES) return false;
+    bool f = fs_evt_double_[index];
+    fs_evt_double_[index] = false;
+    return f;
+}
+
+bool HaroldPCB::FootswitchIsDoubleLongPressed(uint8_t index)
+{
+    if(index >= HPCB_NUM_FOOTSWITCHES) return false;
+    bool f = fs_evt_doublelong_[index];
+    fs_evt_doublelong_[index] = false;
+    return f;
+}
+
+void HaroldPCB::SetFootswitchTiming(const HPCB_FootswitchTiming &t) { fs_timing_ = t; }
+void HaroldPCB::SetDebounce(uint16_t ms)      { fs_timing_.debounce_ms       = ms; }
+void HaroldPCB::SetLongPress(uint16_t ms)     { fs_timing_.longpress_ms      = ms; }
+void HaroldPCB::SetMultiClickGap(uint16_t ms) { fs_timing_.multiclick_gap_ms = ms; }
+
+void HaroldPCB::SetLED(uint8_t index, bool on)
+{
+    if(index >= HPCB_NUM_LEDS) return;
+    digitalWrite(led_pins_[index], on); // ACTIVE-HIGH
 
 }
