@@ -2,6 +2,9 @@
 // by Harold Street Pedals 2025
 // BJT-style distortion using an exponential (diode-equation) soft clip,
 // with drive, bias/asymmetry, tone, momentary kick, and true bypass.
+//
+// Signal Path: Input → Drive → BJT/Diode Soft Clip (+Bias & Asym) → Low-Pass Tone → Master → Out
+//
 
 #include <HaroldPCB.h>
 #include <math.h>
