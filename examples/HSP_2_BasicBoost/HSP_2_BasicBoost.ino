@@ -1,200 +1,187 @@
-// HSP_BasicBoost.ino — v1.0.0
+// HSP_BasicBoost.ino — v1.0.0 (textbook-style, friendly guide)
 // by Harold Street Pedals 2025
-// Transparent clean boost with a simple treble-cut tone control and true passthrough bypass.
 //
-// Structure notes:
-// - Constants for builders are at the top
-// - Fixed 48 kHz / 8-sample blocks
-// - Controls are read in loop() (never inside the audio callback)
-// - Audio callback is mono (in -> out)
-// - Detailed User Guide lives at the bottom
+// Clean, transparent boost with a simple treble‑cut “tone” knob
+// and true passthrough bypass.
+//
+// Signal path: Input → Boost → Tone (low‑pass) → Master (library) → Output
 
 #include <HaroldPCB.h>
 
 // -----------------------------------------------------------------------------
-// Constants (tunable parameters for builders / tinkerers / nerds)
+// SECTION 1 — FIXED SETTINGS (Why these matter)
 // -----------------------------------------------------------------------------
-static const uint32_t SAMPLE_RATE_HZ = 48000;  // Fixed: 48 kHz
-static const uint16_t BLOCK_SIZE = 8;          // Fixed: 8-sample audio block
+// • 48 kHz sample rate: modern “hi‑fi” sound, low latency.
+// • Block size 8: snappy feel without stressing the CPU.
+static const uint32_t SAMPLE_RATE_HZ = 48000;
+static const uint16_t BLOCK_SIZE = 8;
 
-// Boost range (dB). 0 dB = unity, 20 dB ≈ 10x. Adjust to taste.
+// Boost range you’ll feel on the volume knob.
+// 0 dB = same level; +20 dB ≈ 10× louder (useful for driving amps)
 static const float BOOST_MIN_DB = 0.0f;
 static const float BOOST_MAX_DB = 20.0f;
 
-// Tone control = simple one-pole low-pass (post-boost).
-// Map RV2 to cutoff frequency [TONE_CUTOFF_MIN_HZ .. TONE_CUTOFF_MAX_HZ].
-// This is a classic treble-cut “tone” knob: left = darker, right = brighter.
-static const float TONE_CUTOFF_MIN_HZ = 400.0f;   // darker
-static const float TONE_CUTOFF_MAX_HZ = 8200.0f;  // brighter
+// Tone = post‑boost treble cut. Left = darker, Right = brighter.
+// These are musical, guitar‑friendly limits.
+static const float TONE_CUTOFF_MIN_HZ = 400.0f;
+static const float TONE_CUTOFF_MAX_HZ = 8200.0f;
 
-// Master level (post effect) is handled by the library via RV6.
-// We still include a safety trim after processing for experiments.
-static const float OUTPUT_TRIM = 1.0f;  // leave 1.0 for transparent feel
-
-// Safety limit (prevents accidental overs). Raise carefully if you add soft clipping.
-static const float OUT_LIMIT = 1.2f;  // linear peak clamp
+// Final touch and safety:
+// • OUTPUT_TRIM usually 1.0 for “invisible” processing.
+// • OUTPUT_LIMIT stops runaway peaks (keep conservative unless you add soft‑clip).
+static const float OUTPUT_TRIM = 1.0f;
+static const float OUTPUT_LIMIT = 1.2f;
 
 // -----------------------------------------------------------------------------
-// Global state
+// SECTION 2 — SHARED STATE (updated in loop(), read in AudioCB())
 // -----------------------------------------------------------------------------
+// We keep names literal so the code reads like a story.
 static HaroldPCB H;
 
-// Cached control state consumed by the audio thread
-static volatile bool g_bypassed = false;  // FS2 toggles true bypass
-static volatile float g_gain_lin = 1.0f;  // linear boost factor
-static volatile float g_lp_a = 0.0f;      // one-pole smoothing coefficient 'a'
-static volatile float g_lp_b = 1.0f;      // (1 - a) precomputed for efficiency
+static volatile bool effectBypassed = false;  // FS2 flips this
+static volatile float boostFactor = 1.0f;     // linear multiplier (converted from dB)
 
-// Filter memory (audio thread)
-static float g_lp_z = 0.0f;
+// One‑pole tone coefficients: y = toneBlendNew*x + toneBlendOld*y_prev
+static volatile float toneBlendOld = 0.0f;  // “how much past to keep”
+static volatile float toneBlendNew = 1.0f;  // “how much fresh input to take”
 
-// Edge tracking for FS2
-static bool prev_fs2 = false;
+// ⭐ toneMemory: the filter’s “last output” (y_prev).
+// Each new sample blends “now” (sparkle) with a little “recent past” (smoothness).
+static float toneMemory = 0.0f;
+
+// Used to detect a fresh press on FS2 (so we toggle only once per click).
+static bool prevFS2 = false;
 
 // -----------------------------------------------------------------------------
-// Helpers
+// SECTION 3 — SMALL HELPERS (clear math, plain English)
 // -----------------------------------------------------------------------------
 
-// Map 0..1 RV to dB range then to linear gain
-static float PotToLinearGain(float rv01, float db_min, float db_max) {
-  float db = db_min + (db_max - db_min) * rv01;
-  return powf(10.0f, db * (1.0f / 20.0f));
+// 3.1  Knob 0..1 → dB window → linear gain
+// Why: ears think in dB (log), the computer multiplies (linear).
+// Formula you’ll use a lot: linear = 10^(dB/20).
+// Benchmarks: +6 dB ≈ 2×, +12 dB ≈ 4×, +20 dB ≈ 10×
+static float KnobToLinearGain(float knob01, float dbMin, float dbMax) {
+  float dB = dbMin + (dbMax - dbMin) * knob01;
+  return powf(10.0f, dB / 20.0f);
+  // This takes a knob value (0..1) and maps it into a dB range, then converts dB to linear gain.
+  // Step 1: Scale knob position into dBMin..dBMax (our chosen “window”).
+  // Step 2: Convert that dB value into a linear multiplier, since audio math is linear.
+  // Formula reminder: linear = 10^(dB/20). Example: +6dB ≈ 2×, +12dB ≈ 4×, +20dB ≈ 10×.
 }
 
-// Compute one-pole low-pass coefficients from cutoff
-// y[n] = b*x[n] + a*y[n-1], where a = exp(-2*pi*fc/fs), b = 1 - a
-static void UpdateLowpassFromCutoff(float fc_hz) {
-  fc_hz = fmaxf(10.0f, fminf(fc_hz, SAMPLE_RATE_HZ * 0.45f));  // sanity
-  float a = expf(-2.0f * (float)M_PI * fc_hz / (float)SAMPLE_RATE_HZ);
-  g_lp_a = a;
-  g_lp_b = 1.0f - a;
+// 3.2  SetToneFromCutoff: pick how bright/dark the post‑boost sound is
+// One‑pole low‑pass: y = b*x + a*y_prev
+// with a = e^(−2π*fc/fs), b = 1 − a.
+// Intuition: a near 1 = more “memory” = darker.  a small = less memory = brighter.
+static void SetToneFromCutoff(float cutoffHz) {
+  cutoffHz = fmaxf(10.0f, fminf(cutoffHz, SAMPLE_RATE_HZ * 0.45f));  // sensible bounds
+  float a = expf(-2.0f * (float)M_PI * cutoffHz / (float)SAMPLE_RATE_HZ);
+  toneBlendOld = a;
+  toneBlendNew = 1.0f - a;
 }
 
 // -----------------------------------------------------------------------------
-// Audio callback (runs at audio rate). No direct control reads here.
+// SECTION 4 — AUDIO ENGINE (runs for every sample, keep it light)
 // -----------------------------------------------------------------------------
 void AudioCB(float in, float &out) {
-  if (g_bypassed) {
+  if (effectBypassed) {
     out = in;
     return;
   }
 
-  // 1) Apply boost (transparent linear gain)
-  float x = in * g_gain_lin;
+  // STEP 1 — Boost (just a multiply; transparent if OUTPUT_TRIM stays 1.0)
+  float boosted = in * boostFactor;
 
-  // 2) Tone (post-boost treble-cut one-pole LPF)
-  //    z = b*x + a*z
-  g_lp_z = g_lp_b * x + g_lp_a * g_lp_z;
-  float y = g_lp_z;
+  // STEP 2 — Tone (post‑boost treble trim via one‑pole low‑pass)
+  // Blend “now” (boosted) with a touch of “recent past” (toneMemory).
+  toneMemory = toneBlendNew * boosted + toneBlendOld * toneMemory;
+  float y = toneMemory;
 
-  // 3) Output trim and safety clamp
+  // STEP 3 — Final trim + safety
   y *= OUTPUT_TRIM;
-  y = fmaxf(-OUT_LIMIT, fminf(y, OUT_LIMIT));
+  y = fmaxf(-OUTPUT_LIMIT, fminf(y, OUTPUT_LIMIT));
 
   out = y;
 }
 
 // -----------------------------------------------------------------------------
-// Setup (runs once at power-on)
+// SECTION 5 — SETUP (runs once; line up code with the hardware in your hands)
 // -----------------------------------------------------------------------------
 void setup() {
   H.Init(SAMPLE_RATE_HZ, BLOCK_SIZE);
 
-  // Initialize cached parameters from current pot positions
-  g_gain_lin = PotToLinearGain(H.ReadPot(RV1), BOOST_MIN_DB, BOOST_MAX_DB);
+  // Seed parameters from current knob positions so it sounds “as set” at boot.
+  boostFactor = KnobToLinearGain(H.ReadPot(RV1), BOOST_MIN_DB, BOOST_MAX_DB);
 
-  float cutoff0 = H.ReadPotMapped(RV2, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
-  UpdateLowpassFromCutoff(cutoff0);
+  float startCutoff = H.ReadPotMapped(RV2, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
+  SetToneFromCutoff(startCutoff);
 
-  // Master level from RV6 (post-effect trim handled by library)
+  // Post‑effect master level (RV6) is handled by the library.
   H.SetLevel(H.ReadPot(RV6));
 
   H.StartAudio(AudioCB);
 }
 
 // -----------------------------------------------------------------------------
-// Loop (control & UI; not in audio time)
+// SECTION 6 — LOOP (human‑speed control; no heavy work here)
 // -----------------------------------------------------------------------------
 void loop() {
-  H.Idle();  // services pots, toggles, LEDs, and footswitch debounce
+  H.Idle();  // keep pots/toggles/footswitches steady and debounced
 
-  // RV1 → Boost amount in dB (0..20 dB), with perceptual mapping to linear
-  g_gain_lin = PotToLinearGain(H.ReadPot(RV1), BOOST_MIN_DB, BOOST_MAX_DB);
+  // RV1 → Boost (convert dB feel to linear multiply)
+  boostFactor = KnobToLinearGain(H.ReadPot(RV1), BOOST_MIN_DB, BOOST_MAX_DB);
 
-  // RV2 → Tone cutoff (treble cut). Exp curve for nicer feel.
-  {
-    float cutoff = H.ReadPotMapped(RV2, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
-    UpdateLowpassFromCutoff(cutoff);
-  }
+  // RV2 → Tone cutoff (exp curve = nicer feel for frequency knobs)
+  float cutoff = H.ReadPotMapped(RV2, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
+  SetToneFromCutoff(cutoff);
 
-  if (!g_bypassed) {
-    H.SetLevel(H.ReadPotSmoothed(RV6, 15.0f));  // don't allow the pot to control when bypassed,
+  // RV6 → Master only when active. In bypass we force unity so out = in.
+  if (!effectBypassed) {
+    H.SetLevel(H.ReadPotSmoothed(RV6, 15.0f));
   } else {
-    H.SetLevel(1.0f);  // instead set the level to unity.
+    H.SetLevel(1.0f);
   }
 
+  // FS2 → Bypass toggle: flip only on a fresh press
+  bool fs2 = H.FootswitchIsPressed(FS2);
+  if (fs2 && !prevFS2) effectBypassed = !effectBypassed;
+  prevFS2 = fs2;
 
-  // FS2 → Bypass toggle (edge detect)
-  {
-    bool fs2 = H.FootswitchIsPressed(FS2);
-    if (fs2 && !prev_fs2)
-      g_bypassed = !g_bypassed;
-    prev_fs2 = fs2;
-  }
-
-  // LEDs: LED2 shows effect active; LED1 unused here (free for future mods)
-  H.SetLED(LED2, !g_bypassed);
+  // LEDs: LED2 follows effect active; LED1 is yours for mods
+  H.SetLED(LED2, !effectBypassed);
   H.SetLED(LED1, false);
 }
 
 // -----------------------------------------------------------------------------
-// User Guide
+// SECTION 7 — USER GUIDE (friendly + practical)
 // -----------------------------------------------------------------------------
 //
-// Overview
-// --------
-// A transparent **clean boost** with a classic **tone** control. RV1 sets how much
-// level you add (up to ~+20 dB). RV2 acts as a treble-cut (one-pole low-pass) to tame
-// fizz or brighten/darken the signal post-boost. FS2 engages true passthrough bypass.
-// RV6 is a master level after the effect, handled by the HaroldPCB library.
+// What you’ll feel under your fingers
+// • RV1 “Boost”: brings the whole guitar up. Past noon it’ll push most amps.
+// • RV2 “Tone”: left tames fizz (darker), right adds sparkle (brighter).
+// • FS2 “Bypass”: true passthrough; LED2 tells you when Boost+Tone are active.
+// • RV6 “Master”: final volume after the effect (handy for matching levels).
 //
-// Controls
-// --------
-// - RV1 — Boost Amount: 0 dB (unity) to +20 dB (~10×). Transparent linear gain.
-// - RV2 — Tone (Treble-Cut): left = darker (≈400 Hz), right = brighter (≈8.2 kHz).
-// - RV6 — Master: overall output level (post effect) via library SetLevel().
-// - FS2 — Bypass Toggle: on/off for the effect (true passthrough when bypassed).
-// - LED2 — Effect Active: on when the effect is active, off when bypassed.
-// - FS1 / LED1 — Unused in this basic build (reserved for your mods).
+// Quick‑start checklist
+// 1. Start with RV1 at minimum (0 dB) and RV6 at noon.
+// 2. Strum a chord. Toggle FS2: active vs bypass should sound nearly identical.
+// 3. Turn RV1 clockwise until the amp wakes up; trim RV6 to keep stage volume sane.
+// 4. Sweep RV2: find the sweet spot where brightness helps without harshness.
 //
-// Signal Flow
-// -----------
-// Input → Boost (linear gain) → Tone (LPF) → Master (library) → Output
+// Dial‑in recipes
+// • Always‑on sweetener: RV1 at +3–6 dB, RV2 around 3 kHz, RV6 to taste.
+// • Solo lift: RV1 near +8–12 dB, RV2 a touch brighter, assign LED1 as “Solo”.
+// • Tame bright amps: RV1 small (≤+6 dB), RV2 lower (1–2 kHz), OUTPUT_TRIM = 0.9f.
+// • Bass‑friendly: narrow the tone range (e.g., 150–3500 Hz in the constants).
 //
-// Customizable Parameters (see constants at the top)
-// --------------------------------------------------
-// - BOOST_MIN_DB / BOOST_MAX_DB: set your gain window (e.g., cap at +12 dB).
-// - TONE_CUTOFF_MIN_HZ / TONE_CUTOFF_MAX_HZ: widen/narrow the tone range.
-// - OUTPUT_TRIM: overall post-processing trim (keep at 1.0 for “transparent”).
-// - OUT_LIMIT: safety linear peak clamp. Raise with care if you add soft clip.
+// Friendly reminders (important, not fussy)
+// • AudioCB is for quick math only; keep all knob reads in loop().
+// • OUTPUT_LIMIT prevents nasty spikes if you crank things—leave it conservative.
+// • If parameter jumps click, smooth them (we already do for RV6).
 //
-// Mods for Builders / Tinkerers
-// -----------------------------
-// 1) **Tilt EQ Tone**: Replace the low-pass with a tilt (low shelf + high shelf)
-//    pivoting at ~800 Hz; map RV2 to “bright ↔ dark” balance instead of cutoff.
-// 2) **Soft Clip Safety**: Add a gentle saturator after the boost (e.g., tanh or
-//    cubic soft clip) to catch peaks musically rather than hard clamp.
-// 3) **Mid Boost Mode**: Put a peaking EQ at ~900 Hz with Q≈0.7; use TS1 to
-//    toggle mid emphasis for solos.
-// 4) **Momentary Solo**: Make FS1 a momentary +6 dB kick by temporarily raising
-//    g_gain_lin while held; LED1 can indicate the solo boost.
-// 5) **High-Cut “Speaker” Mode**: Add a fixed 6–8 kHz low-pass on TS2 to simulate
-//    small speaker roll-off for direct rigs.
-// 6) **Dual-Range Tone**: Use TS1 to switch the tone range between “Guitar”
-//    (400 Hz–8.2 kHz) and “Bass” (150 Hz–3.5 kHz).
+// Try these mods next
+// • Momentary Solo: make FS1 add +6 dB while held and light LED1.
+// • Softer top: add a fixed 6–8 kHz low‑pass on a toggle for direct rigs.
+// • Tilt EQ: replace the low‑pass with a “bright↔dark” tilt for a single‑knob tone.
 //
-// Version & Credits
-// -----------------
-// v1.0.0 — by Harold Street Pedals 2025. Structured as a textbook example for the
-// HaroldPCB library with constants up top and a prose user guide at the end.
-//
+// End of file.
