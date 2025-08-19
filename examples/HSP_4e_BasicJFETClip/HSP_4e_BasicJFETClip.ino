@@ -2,7 +2,6 @@
 // by Harold Street Pedals 2025
 // Touch-sensitive JFET-style overdrive (square‑law saturation) with bias/asymmetry,
 // simple tone, momentary kick, and true bypass.
-// LEDs are active-HIGH (library v1.3.0+): SetLED(..., true) turns the LED on.
 //
 // Signal path: Input → Drive → JFET Square‑Law (+DC Bias) → LPF Tone → Master → Output
 
