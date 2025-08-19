@@ -78,6 +78,7 @@ static void SetToneFromCutoff(float cutoffHz) {
   float a = expf(-2.0f * (float)M_PI * cutoffHz / (float)SAMPLE_RATE_HZ);
   toneBlendOld = a;
   toneBlendNew = 1.0f - a;
+// More about this when we get to the Filters section 
 }
 
 // -----------------------------------------------------------------------------
