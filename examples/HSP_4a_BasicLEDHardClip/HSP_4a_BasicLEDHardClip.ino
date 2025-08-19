@@ -1,260 +1,196 @@
-// HSP_LEDHardClip.ino — v1.0.0
+// HSP_BasicBoost.ino — v1.0.0 
 // by Harold Street Pedals 2025
-// LED-style hard clipping with symmetry control, simple tone, and bypass.
-//
-// Structure:
-// - Constants for builders at the top
-// - Fixed 48 kHz / 8-sample block
-// - Controls read in loop() (never inside the audio callback)
-// - Mono audio callback does the DSP
-// - Detailed User Guide at the bottom
+// Clean, transparent boost with a simple treble‑cut “tone” knob
+// and true passthrough bypass.
 
 #include <HaroldPCB.h>
 
 // -----------------------------------------------------------------------------
-// Constants (tunable parameters for builders / tinkerers / nerds)
+// SECTION 1 — CONSTANTS (your “settings on the chalkboard”)
 // -----------------------------------------------------------------------------
-static const uint32_t SAMPLE_RATE_HZ = 48000;  // Fixed project-wide
-static const uint16_t BLOCK_SIZE = 8;          // Fixed project-wide
+// We pick a modern sample rate and a tiny block size so latency stays low and
+// the pedal feels immediate.
+static const uint32_t SAMPLE_RATE_HZ = 48000;  // 48,000 samples per second
+static const uint16_t BLOCK_SIZE     = 8;      // process 8 samples at a time
 
-// DRIVE: pre-gain before clipping (in dB)
-static const float DRIVE_MIN_DB = 0.0f;   // unity
-static const float DRIVE_MAX_DB = 36.0f;  // ~63x linear
+// Boost range in decibels (what musicians expect on a knob)
+static const float BOOST_MIN_DB = 0.0f;   // no change
+static const float BOOST_MAX_DB = 20.0f;  // ≈ 10× louder
 
-// MOMENTARY: extra drive while FS1 is held (performance "kick")
-static const float EXTRA_DRIVE_DB = 6.0f;  // +6 dB ≈ 2x
+// Tone (simple one‑pole treble cut) cutoff range in Hertz
+static const float TONE_CUTOFF_MIN_HZ = 400.0f;   // darker
+static const float TONE_CUTOFF_MAX_HZ = 8200.0f;  // brighter
 
-// CLIP THRESHOLDS (LED-like). We operate on normalized audio (≈ -1..+1).
-// "LED" feel is emulated by a relatively high clip threshold vs silicon diodes.
-static const float CLIP_THR_BASE = 0.40f;   // base symmetric threshold
-static const float SYM_RANGE_FRAC = 0.45f;  // RV3 can skew ±45% between +/-
-
-// TONE: one-pole low-pass (post-clipping) for simple treble cut
-static const float TONE_CUTOFF_MIN_HZ = 600.0f;
-static const float TONE_CUTOFF_MAX_HZ = 8200.0f;
-
-// OUTPUT: safety and trim
-static const float OUTPUT_TRIM = 1.0f;  // keep 1.0 for transparent level
-static const float OUT_LIMIT = 1.2f;    // hard ceiling to catch extremes
-
-// CLIP LED decay (visual indicator), 0..1 envelope
-static const float CLIP_LED_DECAY = 0.90f;  // per-loop decay; smaller = faster
+// Optional safety/trim after processing (keep defaults for “transparent” feel)
+static const float OUTPUT_TRIM  = 1.0f;  // leave 1.0 unless you want bias
+static const float OUTPUT_LIMIT = 1.2f;  // clamp peaks just in case
 
 // -----------------------------------------------------------------------------
-// Global state
+// SECTION 2 — GLOBAL STATE (updated in loop(), read in AudioCB())
 // -----------------------------------------------------------------------------
 static HaroldPCB H;
 
-// Cached control state consumed by audio thread
-static volatile bool g_bypassed = false;   // FS2 toggles
-static volatile bool g_kick = false;       // FS1 momentary extra drive
-static volatile float g_drive_lin = 1.0f;  // linear gain factor
-static volatile float g_thr_pos = CLIP_THR_BASE;
-static volatile float g_thr_neg = CLIP_THR_BASE;
-static volatile float g_lp_a = 0.0f;  // LPF a
-static volatile float g_lp_b = 1.0f;  // LPF (1-a)
+// Boost: we store the *linear* multiplier the audio engine needs
+static volatile float boostLinear = 1.0f;  // from dB knob → multiplier
 
-// Audio-thread filter memory
-static float g_lp_z = 0.0f;
+// Tone filter coefficients and memory (one‑pole low‑pass)
+// y[n] = b*x[n] + a*y[n-1]   where a = toneBlendOld,  b = toneBlendNew
+static volatile float toneBlendOld = 0.0f;  // “how much of the recent past to keep”
+static volatile float toneBlendNew = 1.0f;  // “how much of the fresh input to take”
+static float toneMemory = 0.0f;             // last output (y[n-1])
 
-// Clip indicator between threads: set in audio, decayed in loop
-static volatile bool g_clip_hit = false;
-static float g_clip_env = 0.0f;
-
-// Edge tracking for FS2
-static bool prev_fs2 = false;
+// Bypass and footswitch edge tracking
+static volatile bool bypassed = false;
+static bool prevFS2 = false;
 
 // -----------------------------------------------------------------------------
-// Helpers
+// SECTION 3 — MATH HELPERS (with plain‑English notes)
 // -----------------------------------------------------------------------------
-static inline float dB_to_lin(float db) {
-  return powf(10.0f, db * (1.0f / 20.0f));
+
+// dB → linear multiplier
+// Ears like dB (log), but the computer multiplies samples (linear).
+// Formula you’ll reuse everywhere: linear = 10^(dB/20)
+// Benchmarks: +6 dB ≈ 2×, +12 dB ≈ 4×, +20 dB ≈ 10×
+static inline float dBtoLinear(float dB) {
+  return powf(10.0f, dB / 20.0f);
 }
 
-// Map RV ∈ [0..1] to cutoff and compute LPF coeffs:
-// y[n] = b*x[n] + a*y[n-1], with a = exp(-2*pi*fc/fs), b = 1-a
-static void UpdateLowpassFromCutoff(float fc_hz) {
-  fc_hz = fmaxf(10.0f, fminf(fc_hz, SAMPLE_RATE_HZ * 0.45f));
-  float a = expf(-2.0f * (float)M_PI * fc_hz / (float)SAMPLE_RATE_HZ);
-  g_lp_a = a;
-  g_lp_b = 1.0f - a;
-}
-
-// Hard-clip with asymmetry (separate + / - thresholds)
-static inline float HardClipAsym(float x, float th_p, float th_n, bool &clipped) {
-  if (x > th_p) {
-    clipped = true;
-    return th_p;
-  }
-  if (x < -th_n) {
-    clipped = true;
-    return -th_n;
-  }
-  return x;
+// Set the low‑pass filter from a cutoff frequency (Hz).
+// a = exp(-2π*fc/fs),  b = 1 - a
+// Intuition: a near 1 keeps more “yesterday” (darker); small a takes more “today” (brighter).
+static void SetToneFromCutoff(float cutoffHz) {
+  cutoffHz = fmaxf(10.0f, fminf(cutoffHz, SAMPLE_RATE_HZ * 0.45f));
+  float a = expf(-2.0f * (float)M_PI * cutoffHz / (float)SAMPLE_RATE_HZ);
+  toneBlendOld = a;
+  toneBlendNew = 1.0f - a;
 }
 
 // -----------------------------------------------------------------------------
-// Audio callback (runs at audio rate). No control reads here.
+// SECTION 4 — AUDIO CALLBACK (runs at audio speed: keep it lean)
 // -----------------------------------------------------------------------------
 void AudioCB(float in, float &out) {
-  if (g_bypassed) {
-    out = in;
-    return;
-  }
+  if (bypassed) { out = in; return; }
 
-  // 1) Pre-gain (with momentary "kick" if held)
-  float drive = g_drive_lin * (g_kick ? dB_to_lin(EXTRA_DRIVE_DB) : 1.0f);
-  float x = in * drive;
+  // 1) Boost: multiply the input by our linear gain
+  float boosted = in * boostLinear;
 
-  // 2) LED-like hard clip with asym thresholds
-  bool clipped = false;
-  float y = HardClipAsym(x, g_thr_pos, g_thr_neg, clipped);
-  if (clipped) g_clip_hit = true;
+  // 2) Tone: mix “now” (boosted) with a little “recent past” (toneMemory)
+  //    y = b*x + a*y_prev
+  toneMemory = toneBlendNew * boosted + toneBlendOld * toneMemory;
+  float toned = toneMemory;
 
-  // 3) Post low-pass "tone"
-  g_lp_z = g_lp_b * y + g_lp_a * g_lp_z;
-  y = g_lp_z;
+  // 3) Optional safety/trim
+  toned *= OUTPUT_TRIM;
+  toned  = fmaxf(-OUTPUT_LIMIT, fminf(toned, OUTPUT_LIMIT));
 
-  // 4) Output trim + safety limit
-  y *= OUTPUT_TRIM;
-  y = fmaxf(-OUT_LIMIT, fminf(y, OUT_LIMIT));
-
-  out = y;
+  out = toned;
 }
 
 // -----------------------------------------------------------------------------
-// Setup (once)
+// SECTION 5 — SETUP (runs once, align code with real‑world knob positions)
 // -----------------------------------------------------------------------------
 void setup() {
   H.Init(SAMPLE_RATE_HZ, BLOCK_SIZE);
 
-  // Initialize params from current pots
-  g_drive_lin = dB_to_lin(H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10));
-  float tone0 = H.ReadPotMapped(RV2, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
-  UpdateLowpassFromCutoff(tone0);
+  // Seed parameters from current knobs so it “boots sounding like it looks”
+  float boostDbAtBoot = H.ReadPotMapped(RV1, BOOST_MIN_DB, BOOST_MAX_DB, HPCB_Curve::Exp10);
+  boostLinear = dBtoLinear(boostDbAtBoot);
 
-  // Initial symmetry (RV3 center = symmetric)
-  {
-    float r = H.ReadPot(RV3) * 2.0f - 1.0f;  // -1..+1
-    float skew = r * SYM_RANGE_FRAC;
-    g_thr_pos = fmaxf(0.05f, CLIP_THR_BASE * (1.0f + skew));
-    g_thr_neg = fmaxf(0.05f, CLIP_THR_BASE * (1.0f - skew));
-  }
+  float toneCutoffAtBoot = H.ReadPotMapped(RV2, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
+  SetToneFromCutoff(toneCutoffAtBoot);
 
-  // Master level (post)
+  // Master volume (post effect, handled by the library)
   H.SetLevel(H.ReadPot(RV6));
 
   H.StartAudio(AudioCB);
 }
 
 // -----------------------------------------------------------------------------
-// Loop (controls, UI, LEDs)
+// SECTION 6 — LOOP (textbook walkthrough with tiny ASCII signal maps)
+// -----------------------------------------------------------------------------
+// Philosophy: read controls here (slow lane), *never* in the audio callback.
+// We translate knobs into clean numbers the audio thread can use.
+//
+// Legend for the mini‑diagrams:
+//   [KNOB] --> (mapping) --> [PARAM USED BY AUDIO]
 // -----------------------------------------------------------------------------
 void loop() {
-  H.Idle();  // services pots, toggles, and footswitch debounce
+  // Keep hardware scanning fresh (pots, toggles, debounced switches)
+  H.Idle();
 
-  // RV1 → Drive (dB → linear), perceptual curve
-  g_drive_lin = dB_to_lin(H.ReadPotMapped(RV1, DRIVE_MIN_DB, DRIVE_MAX_DB, HPCB_Curve::Exp10));
+  // --- RV1 (Boost amount) ----------------------------------------------------
+  // [RV1 0..1] --> (map to dB window) --> [dB] --> (10^(dB/20)) --> [boostLinear]
+  //
+  // Steps:
+  //  1) Map 0..1 into BOOST_MIN_DB..BOOST_MAX_DB (Exp curve feels musical).
+  //  2) Convert that dB number into a multiplier the audio callback can use.
+  //
+  // Quick mental math:
+  //   halfway-ish (~10 dB) → ~3.16×
+  float boostDb = H.ReadPotMapped(RV1, BOOST_MIN_DB, BOOST_MAX_DB, HPCB_Curve::Exp10);
+  boostLinear = dBtoLinear(boostDb);
 
-  // RV2 → Tone (LPF cutoff)
-  {
-    float fc = H.ReadPotMapped(RV2, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
-    UpdateLowpassFromCutoff(fc);
-  }
+  // --- RV2 (Tone cutoff) -----------------------------------------------------
+  // [RV2 0..1] --> (map to Hz range) --> [cutoffHz] --> (exp coeffs) --> [toneBlendOld/New]
+  //
+  // Steps:
+  //  1) Map 0..1 into TONE_CUTOFF_MIN_HZ..TONE_CUTOFF_MAX_HZ (Exp curve again).
+  //  2) Recompute the filter’s a/b coefficients for that cutoff.
+  //
+  // Ear guide:
+  //   lower cutoff → darker; higher cutoff → brighter.
+  float cutoffHz = H.ReadPotMapped(RV2, TONE_CUTOFF_MIN_HZ, TONE_CUTOFF_MAX_HZ, HPCB_Curve::Exp10);
+  SetToneFromCutoff(cutoffHz);
 
-  // RV3 → Symmetry: skew positive vs negative threshold
-  {
-    float r = H.ReadPot(RV3) * 2.0f - 1.0f;  // -1..+1
-    float skew = r * SYM_RANGE_FRAC;
-    g_thr_pos = fmaxf(0.05f, CLIP_THR_BASE * (1.0f + skew));
-    g_thr_neg = fmaxf(0.05f, CLIP_THR_BASE * (1.0f - skew));
-  }
-
-  // RV6 → Master (post), with light smoothing for fine moves
-  if (!g_bypassed) {
-    H.SetLevel(H.ReadPotSmoothed(RV6, 15.0f)); // Don't read pot if bypassed,
+  // --- RV6 (Master volume, post effect) --------------------------------------
+  // If the effect is active, follow RV6 (with light smoothing to avoid zippering).
+  // If bypassed, force unity so the pedal is truly transparent.
+  //
+  // [RV6 0..1] --> (optional smoothing) --> [master level]
+  if (!bypassed) {
+    H.SetLevel(H.ReadPotSmoothed(RV6, 15.0f));  // ~15 ms smoothing feels steady
   } else {
-    H.SetLevel(1.0f);  // instead set unity gain.
+    H.SetLevel(1.0f);                           // unity gain in bypass
   }
 
+  // --- FS2 (Bypass toggle) ---------------------------------------------------
+  // Edge‑detect so we only toggle once per press (no repeat while held).
+  //
+  // [FS2] --> (rising edge?) --> [flip bypassed]
+  bool fs2 = H.FootswitchIsPressed(FS2);
+  if (fs2 && !prevFS2) { bypassed = !bypassed; }
+  prevFS2 = fs2;
 
-  // FS1 → momentary extra drive (no reads in audio thread)
-  g_kick = H.FootswitchIsPressed(FS1);
+  // --- LED2 (Effect active indicator) ----------------------------------------
+  // Lights when the effect path is engaged.
+  H.SetLED(LED2, !bypassed);
 
-  // FS2 → bypass toggle (edge detect)
-  {
-    bool fs2 = H.FootswitchIsPressed(FS2);
-    if (fs2 && !prev_fs2) g_bypassed = !g_bypassed;
-    prev_fs2 = fs2;
-  }
-
-  // LEDs:
-  // - LED2 = effect active
-  H.SetLED(LED2, !g_bypassed);
-
-  // - LED1 = clip indicator (envelope decays each loop)
-  if (g_clip_hit) {
-    g_clip_env = 1.0f;
-    g_clip_hit = false;
-  }
-  g_clip_env *= CLIP_LED_DECAY;
-  H.SetLED(LED1, g_clip_env > 0.12f || g_kick);  // also show while kick is held
+  // (LED1 is free—use it for your own mods if you like!)
 }
 
 // -----------------------------------------------------------------------------
-// User Guide
+// SECTION 7 — USER GUIDE (friendly & practical)
 // -----------------------------------------------------------------------------
 //
-// Overview
-// --------
-// This pedal models **LED hard clipping** in the simplest classic way: a strong
-// pre-gain pushes the signal into a fixed ceiling (separate + / – thresholds for
-// asymmetry), then a one-pole treble-cut "tone" shapes fizz. It’s punchy, loud,
-// and harmonically rich — the vibe of LED clippers in dirt boxes.
+// What the knobs do (in real words)
+// • RV1 “Boost”: turns the whole signal up. +6 dB ≈ 2×, +12 dB ≈ 4×, +20 dB ≈ 10×.
+// • RV2 “Tone”: after the boost, trims highs. Left = smoother/darker, right = brighter.
+// • RV6 “Master”: overall level after the effect (good for matching bypass volume).
+// • FS2 toggles a *true* passthrough bypass. LED2 lights when the effect is ON.
 //
-// Controls
-// --------
-// - RV1 — Drive: 0 to +36 dB pre-gain (Exp curve for musical sweep).
-// - RV2 — Tone (Treble-Cut): 600 Hz to 8.2 kHz one-pole LPF after the clipper.
-// - RV3 — Symmetry: skews positive vs negative clip thresholds (center = symmetric).
-// - RV6 — Master: overall output level (post effect), via library SetLevel().
-// - FS1 — Momentary Extra Drive: hold for +6 dB extra push into the clipper.
-// - FS2 — Bypass Toggle: true passthrough on/off.
-// - LED1 — Clip Indicator: lights on clipping (decays visually); also on during FS1.
-// - LED2 — Effect Active: lit when the effect is engaged.
+// How the math maps to sound
+// • Boost is just multiplication. dB is for humans; the code converts it to a number to multiply.
+// • The tone filter “remembers” a bit of the last sound (that’s toneMemory). More memory → darker.
 //
-// Signal Flow
-// -----------
-// Input → Drive (dB → linear) → Hard Clip (LED-like, asym capable) → LPF Tone → Master → Out
+// Quick start
+// 1) Set RV1 low, RV2 around noon, RV6 so bypass and effect sound equally loud.
+// 2) Click FS2 to A/B the tone. Raise RV1 until your amp wakes up.
+// 3) Sweep RV2 to taste: shave fizz or add sparkle.
 //
-// What Makes It “LED” Here?
-// -------------------------
-// Real LEDs clip at higher forward voltages than small-signal diodes, so they
-// feel **louder and less squashed**. We emulate that by using a **higher clip
-// threshold (CLIP_THR_BASE)** and by offering **asymmetry** (RV3) to mimic LED
-// mismatch and op-amp bias quirks.
+// Tinker ideas
+// • Cap BOOST_MAX_DB at +12 dB for a subtler always‑on sweetener.
+// • Narrow tone range to 800–4000 Hz if you want a tighter “bright/dark” feel.
+// • Use LED1 as a “solo” light and have FS1 add a momentary +6 dB in your own mod.
 //
-// Customizable Parameters (top of file)
-// -------------------------------------
-// - DRIVE_MIN_DB / DRIVE_MAX_DB: set your gain window (e.g., +18 dB for cleaner).
-// - EXTRA_DRIVE_DB: performance kick amount on FS1.
-// - CLIP_THR_BASE: overall clip ceiling (lower = more distortion at the same drive).
-// - SYM_RANGE_FRAC: how far RV3 can skew asymmetry.
-// - TONE_CUTOFF_MIN_HZ / MAX: voice the treble-cut range.
-// - OUTPUT_TRIM / OUT_LIMIT: global calibration and safety.
-//
-// Mods for Builders / Tinkerers
-// -----------------------------
-// 1) **Pre-EQ Tighten:** High-pass before the clipper (e.g., 80–120 Hz) to cut mud.
-// 2) **OP-AMP “Feel”:** Replace hard clip with tanh() for a softer feedback-style edge.
-// 3) **LED Color Modes:** Use TS1 to switch thresholds to “red/amber/blue” profiles.
-// 4) **Post Presence:** Add a small high-shelf after the LPF to restore sparkle.
-// 5) **Asym Bias Control:** Map RV3 to add a DC bias pre-clip instead of threshold skew.
-// 6) **Anti-Alias:** If you push extreme drive, consider 2× oversampling in a future
-//    advanced example to reduce fold-back on very bright tones.
-//
-// Version & Credits
-// -----------------
-// v1.0.0 — by Harold Street Pedals 2025. Structured as a textbook example for the
-// HaroldPCB library with constants up top and a prose user guide at the end.
-//
+// Version
+// v1.0.0 — Harold Street Pedals 2025
