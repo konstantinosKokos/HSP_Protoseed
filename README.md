@@ -53,7 +53,7 @@ HaroldPCB/
    - Confirm audio passes through; LED logic should be **active‑HIGH**
 5. **Tweak constants** at the top of the sketch and reflash
 
-
+---
 
 ## 3B) Installation (DFU on Windows, step-by-step)
 
