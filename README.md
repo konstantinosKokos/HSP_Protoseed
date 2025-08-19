@@ -41,7 +41,7 @@ HaroldPCB/
 
 ---
 
-## 3A) Quick start
+## 3A) Quick Start
 1. **Install toolchain**
    - Arduino IDE 2.x or PlatformIO
    - Board support per your HaroldPCB target (same setup you already use to flash other HSP sketches)
