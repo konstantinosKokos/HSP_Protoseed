@@ -1,4 +1,4 @@
-// HSP_BasicBoost.ino — v1.0.0 (textbook-style, friendly guide)
+// HSP_BasicBoost.ino — v1.0.0 
 // by Harold Street Pedals 2025
 //
 // Clean, transparent boost with a simple treble‑cut “tone” knob
