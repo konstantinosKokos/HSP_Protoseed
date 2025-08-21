@@ -75,6 +75,7 @@ In the MSYS2 window, paste these commands one by one:
 ```bash
 pacman -Syu       # full system update (will close the window, reopen after)
 pacman -S git make gcc unzip dfu-util
+```
 
 git lets you download code from GitHub.
 
@@ -90,10 +91,11 @@ dfu-util is the program that talks to the Daisy Seed in bootloader mode.
 
 Still inside MSYS2:
 
+```bash
 cd ~
 git clone https://github.com/Harold-Street-Pedal-Company/HSP_Protoseed.git
 cd HSP_Protoseed
-
+```
 
 ---
 
@@ -116,7 +118,9 @@ Windows will show a new device called STM32 BOOTLOADER if it worked.
 
 Inside MSYS2, from the library folder:
 
+```bash
 make program-dfu
+```
 
 This compiles the default sketch and immediately flashes it with dfu-util.
 
@@ -181,7 +185,7 @@ void loop() {
   H.Idle();                 // services pots/toggles/footswitches
   H.SetLED(LED2, true);     // active‑HIGH
 }
-
+```
 
 ### 4.2 Common API calls
 - **Lifecycle**: `H.Init(sr, block)`, `H.StartAudio(callback)`, `H.Idle()`
