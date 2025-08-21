@@ -250,8 +250,12 @@ Each example is versioned **v1.0.0**, constants up top, and ends with a beginner
 - Start each sketch with:
   ```
   // BasicEffectName.ino — v1.0.0
-  // by Harold Street Pedals 2025
+  // By [YourName] [Date]
+  // For Harold Street Pedals' Protoseed v1.2
   // One‑line description
+  // Basic control operation
+  //
+  // Include a user more thourough User guide at the bottom of the sketch.
   ```
 - Keep **constants at the top** (clearly commented) — these are the hidden knobs for builders
 - Use clear sections: *Includes & Globals → Constants → DSP structs → setup() → loop() → AudioCB → helpers → User Guide*
