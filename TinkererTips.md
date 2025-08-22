@@ -1,29 +1,29 @@
-###💡 Tips for Tinkerers
+#💡 Tips for Tinkerers
 
-#Keep controls out of the audio callback.
+##Keep controls out of the audio callback.
 Polling hardware inside the audio thread can cause clicks and glitches. Always read controls in loop() (via Idle()), then feed cached values into your DSP.
 
-#Mono only, by design.
+##Mono only, by design.
 The library hard-mutes the right channel. Don’t waste CPU trying to run stereo — left in/out is all you need.
 
-#Map pots explicitly.
+##Map pots explicitly.
 Always use ReadPotMapped() or ReadPotSmoothed() with clear ranges. Your sketch should read like:
 
 ```cpp
 float speed = hpcb.ReadPotMapped(RV1, 0.1f, 5.0f);
 ```
 
-#Bypass is a real unity path.
+##Bypass is a real unity path.
 When you call SetBypassed(true), your audio skips all DSP and ignores master level. Good for sanity checks.
 
-#Experiment safely.
+##Experiment safely.
 No Serial is used in examples so you can always reflash in DFU mode without bricking. If you add Serial, do it carefully.
 
 #Readable beats clever.
 Use clear variable names and comments. This repo is meant as a teaching tool as much as a DSP sandbox.
 
 
-###🔧 Tinkering with Sketches — Quick Tutorial
+#🔧 Tinkering with Sketches — Quick Tutorial
 
 So you’ve opened one of the example .ino files and want to make it yours. Here’s the safe way to experiment:
 
