@@ -45,14 +45,14 @@ Each sketch starts with:
 ```cpp
 #include <HaroldPCB.h>
 HaroldPCB hpcb;
-5) Build & Upload
+```
+## 5) Build & Upload
 Click Verify, then Upload.
 No extra third-party libraries or Makefile needed — DaisyDuino is vendored and included.
 
-6) Minimal Sketch Pattern
-cpp
-Copy
-Edit
+## 6) Minimal Sketch Pattern
+
+```CPP
 #include <HaroldPCB.h>
 HaroldPCB hpcb;
 
@@ -68,21 +68,22 @@ void setup() {
 void loop() {
   hpcb.Idle();                  // polls pots/toggles/footswitches (debounced)
 }
-7) Useful Tips
+```
+## 7) Useful Tips
 Mono only: Left in/out; Right out is hard-muted by the library.
 
 Footswitch feel (debounce/long/double) can be tuned:
 
-cpp
-Copy
-Edit
+```cpp
 HPCB_FootswitchTiming t;
 t.debounce_ms       = 12;
 t.longpress_ms      = 600;
 t.multiclick_gap_ms = 300;
 hpcb.SetFootswitchTiming(t);
+```
 Latency vs CPU: Smaller blocks = lower latency, higher CPU load.
-Change with hpcb.Init(96000, 4); if needed.
+Change with `hpcb.Init(96000, 4);` if needed.
 
-8) Philosophy
-Readable over clever. Explicit over implicit. Self-contained over dependency sprawl.
+## 8) Philosophy
+   
+**Readable over clever. Explicit over implicit. Self-contained over dependency sprawl.**
